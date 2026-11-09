@@ -328,7 +328,6 @@ def test_password_change_validates_then_succeeds(auth):
     assert too_short.status_code == 400
     assert "at least 8" in too_short.text
 
-    # Run the successful change last: it invalidates the fixture's password.
     ok = auth.post(
         "/account/password",
         data={
@@ -351,3 +350,17 @@ def test_password_change_validates_then_succeeds(auth):
         ).status_code
         == 303
     )
+
+    # Put it back. The account is shared across the whole session, so leaving
+    # it changed would break the auth fixture for every test that runs after
+    # this one.
+    restored = auth.post(
+        "/account/password",
+        data={
+            "current_password": "brandnewpass1",
+            "new_password": "testpass123",
+            "confirm_password": "testpass123",
+        },
+    )
+    assert restored.status_code == 200
+    assert "Password changed" in restored.text

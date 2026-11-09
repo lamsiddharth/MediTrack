@@ -52,4 +52,71 @@
     </form>
   </section>
 </div>
+
+<section class="card">
+  <h2>Session notes</h2>
+
+  {% if note_error %}<p class="alert error">{{ note_error }}</p>{% endif %}
+  {% if noted %}<p class="alert ok">Note added.</p>{% endif %}
+
+  {% if notes %}
+    <div class="notes">
+      {% for item in notes %}
+      <article class="note">
+        <header>
+          <strong>{{ item.note.title }}</strong>
+          <span class="muted small">
+            {{ item.note.created_at | datetime }} · {{ item.note.author.full_name }}
+          </span>
+        </header>
+
+        {% if item.unavailable %}
+          <p class="alert warn">
+            The text of this note could not be read from storage.
+          </p>
+        {% else %}
+          <p class="note-body">{{ item.body | nl2br }}</p>
+        {% endif %}
+
+        {% if item.note.has_attachment %}
+        <p class="attachment">
+          <a href="/consultations/{{ consultation.id }}/notes/{{ item.note.id }}/attachment">
+            {{ item.note.attachment_filename }}
+          </a>
+          <span class="muted small">{{ item.note.attachment_size_label }}</span>
+        </p>
+        {% endif %}
+      </article>
+      {% endfor %}
+    </div>
+  {% else %}
+    <p class="empty">No progress notes on this session yet.</p>
+  {% endif %}
+
+  <details class="add-note" {{ 'open' if note_error }}>
+    <summary>Add a note</summary>
+
+    <form method="post" action="/consultations/{{ consultation.id }}/notes"
+          enctype="multipart/form-data">
+      <label for="note_title">Title</label>
+      <input id="note_title" name="title" maxlength="120" required
+             placeholder="e.g. Telephone follow-up">
+
+      <label for="note_body">Note</label>
+      <textarea id="note_body" name="body" rows="4" required
+                placeholder="What happened, what was advised, what changed."></textarea>
+
+      <label for="note_attachment">Attachment <span class="req">optional</span></label>
+      <input id="note_attachment" name="attachment" type="file" accept="{{ accept_attr }}">
+      <p class="hint">
+        Up to {{ max_attachment_mb }} MB. Accepted: {{ allowed_extensions }}.
+        Notes cannot be edited or deleted once saved.
+      </p>
+
+      <div class="form-actions">
+        <button type="submit" class="primary">Save note</button>
+      </div>
+    </form>
+  </details>
+</section>
 {% endblock %}

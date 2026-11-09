@@ -13,6 +13,18 @@ os.environ["DATABASE_URL"] = f"sqlite:///{Path(_tmp) / 'test.db'}"
 os.environ["SECRET_KEY"] = "test-secret-key-not-for-production"
 os.environ["SEED_PASSWORD"] = "testpass123"
 os.environ["SEED_DEMO_DATA"] = "true"
+os.environ["STORAGE_BACKEND"] = "local"
+os.environ["LOCAL_STORAGE_DIR"] = str(Path(_tmp) / "objects")
+
+# Fake credentials, and no metadata lookups. Without these, any accidental
+# real boto3 call would stall for a long time trying to reach the EC2
+# instance-metadata endpoint instead of failing fast.
+os.environ.setdefault("AWS_ACCESS_KEY_ID", "testing")
+os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "testing")
+os.environ.setdefault("AWS_SECURITY_TOKEN", "testing")
+os.environ.setdefault("AWS_SESSION_TOKEN", "testing")
+os.environ.setdefault("AWS_DEFAULT_REGION", "ap-southeast-2")
+os.environ.setdefault("AWS_EC2_METADATA_DISABLED", "true")
 
 from fastapi.testclient import TestClient  # noqa: E402
 

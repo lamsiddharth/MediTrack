@@ -7,6 +7,7 @@ Docker. Written for this project rather than vendored from elsewhere.
 |---|---|
 | **Application** | MediTrack — Python / FastAPI, server-rendered HTML, SQLite |
 | **Image delivery** | Source sent to the instance over SSH and built there. No registry, no local Docker. |
+| **Session notes** | Stored in S3 (`meditrack-session-notes-808122334310`, ap-southeast-2) |
 | **Cloud** | AWS EC2 — `t3.micro`, Amazon Linux 2023 |
 | **Sign in** | `admin` / `admin123` — change it immediately after first login |
 
@@ -39,6 +40,12 @@ The workflow of a small clinic, end to end:
   completed automatically. A walk-in can be recorded with no prior booking.
 - **Billing** — a fee and payment status per consultation, an "unpaid only"
   filter, and total outstanding on the dashboard.
+- **Session notes** — an append-only timeline of progress notes on a session,
+  added after the initial write-up. Each note has a title, text, and optionally
+  an attached document (lab report, scan). **The note text and the attachment
+  both live in S3**, not in the database: the row holds only metadata and the
+  object key. Notes cannot be edited or deleted — a clinical record that can be
+  silently rewritten is not much of a record.
 - **Dashboard** — patient and doctor counts, today's schedule, who is still to
   be seen, what is coming up, recent records, and money outstanding.
 
@@ -104,9 +111,88 @@ Every setting is an environment variable with a sensible default.
 | `SEED_PASSWORD` | `admin123` | Only used when first creating the account |
 | `SEED_FULL_NAME` | `Dr. A. Menon` | Display name |
 | `SEED_DEMO_DATA` | `true` | `false` to skip the demo records |
+| `STORAGE_BACKEND` | `local` | `local` or `s3` |
+| `LOCAL_STORAGE_DIR` | `<DATA_DIR>/objects` | Where the local driver writes |
+| `S3_BUCKET` | — | Required when `STORAGE_BACKEND=s3` |
+| `S3_PREFIX` | `session-notes` | Key prefix inside the bucket |
+| `AWS_REGION` | — | Bucket region |
+| `S3_ENDPOINT_URL` | — | For a non-AWS S3-compatible store (MinIO) |
+| `S3_URL_TTL` | `300` | Presigned attachment URL lifetime, seconds |
+| `MAX_ATTACHMENT_BYTES` | `10485760` | 10 MB |
 
 `deploy.sh` generates a `SECRET_KEY` once into `.secret-key` and reuses it, so
 redeploying does not sign you out. That file is gitignored — keep it.
+
+---
+
+## Object storage for session notes
+
+The bucket is already created in account `808122334310` (ap-southeast-2):
+
+```
+meditrack-session-notes-808122334310
+```
+
+It is configured with all public access blocked, SSE-S3 default encryption,
+versioning enabled (so an overwritten or deleted note object is recoverable),
+and a bucket policy denying any request not over TLS.
+
+### Credentials
+
+The existing instance is **Lightsail**, which has no IAM instance roles — there
+is no instance profile to attach, so the container cannot pick up temporary
+credentials the way an EC2 instance would. It therefore needs static keys.
+
+An IAM user `meditrack-app` exists with exactly this policy and nothing else:
+
+```json
+{
+  "Effect": "Allow",
+  "Action": ["s3:PutObject", "s3:GetObject"],
+  "Resource": "arn:aws:s3:::meditrack-session-notes-808122334310/session-notes/*"
+}
+```
+
+No delete, no listing, no other bucket, no other service. If the instance is
+compromised, the blast radius is read/write on that one prefix.
+
+Create an access key for it and write the result to `.aws-app-credentials`
+(gitignored), which `deploy.sh` reads:
+
+```bash
+AWS_PROFILE=new aws iam create-access-key --user-name meditrack-app \
+  --query 'AccessKey.[AccessKeyId,SecretAccessKey]' --output text
+```
+
+```
+# .aws-app-credentials
+AWS_ACCESS_KEY_ID=...
+AWS_SECRET_ACCESS_KEY=...
+AWS_REGION=ap-southeast-2
+S3_BUCKET=meditrack-session-notes-808122334310
+S3_PREFIX=session-notes
+```
+
+`chmod 600` it. Without this file `deploy.sh` falls back to local storage on
+the instance, which works but keeps notes on one disk with no backup.
+
+Rotate the key if it is ever exposed:
+
+```bash
+AWS_PROFILE=new aws iam list-access-keys --user-name meditrack-app
+AWS_PROFILE=new aws iam delete-access-key --user-name meditrack-app --access-key-id <old>
+```
+
+### How attachments are served
+
+The bucket is private. Downloads are not proxied through the instance: the app
+returns a 303 to a short-lived presigned URL and S3 serves the bytes directly,
+which keeps large files off a 1 GiB box.
+
+> Presigned URLs must be signed against the **regional** endpoint. Signed
+> against the global `s3.amazonaws.com`, S3 answers with a 307 to the regional
+> host, and because SigV4 signs the host the redirect invalidates the
+> signature. `storage.py` sets `addressing_style: "virtual"` for this reason.
 
 ---
 

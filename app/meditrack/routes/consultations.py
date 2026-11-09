@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import date, datetime
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request
@@ -9,6 +10,7 @@ from fastapi.responses import RedirectResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload
 
+from meditrack import config
 from meditrack.db import get_session
 from meditrack.models import (
     Appointment,
@@ -17,10 +19,14 @@ from meditrack.models import (
     Doctor,
     Patient,
     PaymentStatus,
+    SessionNote,
     User,
 )
 from meditrack.security import current_user
+from meditrack.storage import StorageError, get_store
 from meditrack.templating import templates
+
+log = logging.getLogger("meditrack.consultations")
 
 router = APIRouter(prefix="/consultations")
 
@@ -194,21 +200,52 @@ async def create_consultation(
 async def consultation_detail(
     request: Request,
     consultation_id: int,
+    noted: str = "",
+    note_error: str = "",
     user: User = Depends(current_user),
     session: Session = Depends(get_session),
 ):
     consultation = session.get(
         Consultation,
         consultation_id,
-        options=[joinedload(Consultation.patient), joinedload(Consultation.doctor)],
+        options=[
+            joinedload(Consultation.patient),
+            joinedload(Consultation.doctor),
+            joinedload(Consultation.session_notes).joinedload(SessionNote.author),
+        ],
     )
     if consultation is None:
         raise HTTPException(status_code=404)
 
+    # Note bodies live in object storage, so each one is a fetch. There are
+    # only ever a handful per session. A body that cannot be retrieved is
+    # reported in place rather than failing the whole page.
+    store = get_store()
+    notes = []
+    for note in consultation.session_notes:
+        try:
+            body = store.get(note.body_key).decode("utf-8", errors="replace")
+            unavailable = False
+        except StorageError:
+            log.warning("note %s body missing from storage (%s)", note.id, note.body_key)
+            body = None
+            unavailable = True
+        notes.append({"note": note, "body": body, "unavailable": unavailable})
+
     return templates.TemplateResponse(
         request,
         "consultations/detail.html",
-        {"user": user, "consultation": consultation, "payment_statuses": list(PaymentStatus)},
+        {
+            "user": user,
+            "consultation": consultation,
+            "payment_statuses": list(PaymentStatus),
+            "notes": notes,
+            "noted": bool(noted),
+            "note_error": note_error or None,
+            "max_attachment_mb": config.MAX_ATTACHMENT_BYTES // (1024 * 1024),
+            "allowed_extensions": ", ".join(sorted(config.ALLOWED_ATTACHMENT_TYPES.values())),
+            "accept_attr": ",".join(sorted(config.ALLOWED_ATTACHMENT_TYPES)),
+        },
     )
 
 

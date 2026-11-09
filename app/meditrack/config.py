@@ -28,3 +28,33 @@ SEED_FULL_NAME = os.environ.get("SEED_FULL_NAME", "Dr. A. Menon")
 
 # Whether to populate demo records on an empty database.
 SEED_DEMO_DATA = os.environ.get("SEED_DEMO_DATA", "true").lower() in {"1", "true", "yes"}
+
+# --- Object storage for session notes -------------------------------------
+# "local" keeps objects on disk so the app runs with no AWS account.
+# "s3" is what the deployed instance uses.
+STORAGE_BACKEND = os.environ.get("STORAGE_BACKEND", "local").strip().lower()
+
+LOCAL_STORAGE_DIR = Path(
+    os.environ.get("LOCAL_STORAGE_DIR", str(DATA_DIR / "objects"))
+).resolve()
+
+S3_BUCKET = os.environ.get("S3_BUCKET", "")
+S3_PREFIX = os.environ.get("S3_PREFIX", "session-notes")
+AWS_REGION = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or None
+
+# Override the S3 endpoint, for a non-AWS S3-compatible store (MinIO, etc).
+S3_ENDPOINT_URL = os.environ.get("S3_ENDPOINT_URL", "")
+
+# Lifetime of a presigned attachment URL, in seconds.
+S3_URL_TTL = int(os.environ.get("S3_URL_TTL", 300))
+
+# Attachment limits. Enforced before anything is sent to storage.
+MAX_ATTACHMENT_BYTES = int(os.environ.get("MAX_ATTACHMENT_BYTES", 10 * 1024 * 1024))
+
+ALLOWED_ATTACHMENT_TYPES = {
+    "application/pdf": ".pdf",
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/webp": ".webp",
+    "text/plain": ".txt",
+}

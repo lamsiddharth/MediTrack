@@ -189,3 +189,23 @@ form.inline { display: inline; }
 
 .hint { color: var(--muted); font-size: .8rem; margin-top: 1rem; }
 .hint code { background: var(--bg); padding: .1rem .3rem; border-radius: 4px; }
+
+/* ---------- session notes ---------- */
+.notes { margin-bottom: 1rem; }
+.note { border-left: 3px solid var(--line); padding: .1rem 0 .75rem .85rem; margin-bottom: .85rem; }
+.note:last-child { margin-bottom: 0; }
+.note header { display: flex; align-items: baseline; gap: .6rem; flex-wrap: wrap; margin-bottom: .3rem; }
+.note-body { margin: .2rem 0 .5rem; }
+.attachment { margin: .4rem 0 0; display: flex; gap: .5rem; align-items: baseline; }
+.attachment a::before { content: "\1F4CE"; margin-right: .35rem; }
+
+.add-note { border-top: 1px solid var(--line); padding-top: .85rem; }
+.add-note summary {
+  cursor: pointer; font-weight: 500; color: var(--accent);
+  list-style: none; display: inline-block;
+}
+.add-note summary::-webkit-details-marker { display: none; }
+.add-note summary::before { content: "+ "; font-weight: 700; }
+.add-note[open] summary::before { content: "\2212 "; }
+.add-note summary:hover { text-decoration: underline; }
+input[type="file"] { padding: .4rem; background: var(--bg); }

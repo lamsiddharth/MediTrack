@@ -11,7 +11,15 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
 
 from meditrack import config
-from meditrack.routes import appointments, auth, consultations, dashboard, doctors, patients
+from meditrack.routes import (
+    appointments,
+    auth,
+    consultations,
+    dashboard,
+    doctors,
+    notes,
+    patients,
+)
 from meditrack.security import NotLoggedIn, redirect_to_login
 from meditrack.seed import init_db
 from meditrack.templating import templates
@@ -70,6 +78,7 @@ app.include_router(patients.router)
 app.include_router(doctors.router)
 app.include_router(appointments.router)
 app.include_router(consultations.router)
+app.include_router(notes.router)
 
 
 @app.get("/healthz", include_in_schema=False)

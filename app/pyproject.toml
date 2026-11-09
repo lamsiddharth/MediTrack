@@ -11,12 +11,14 @@ dependencies = [
     "python-multipart==0.0.20",
     "itsdangerous==2.2.0",
     "bcrypt==5.0.0",
+    "boto3==1.40.49",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest==8.4.2",
     "httpx==0.28.1",
+    "moto[s3]==5.1.21",
 ]
 
 [build-system]

@@ -55,6 +55,37 @@ else
   echo "==> Generated .secret-key (keep it; it is gitignored)"
 fi
 
+# Object storage for session notes. With .aws-app-credentials present the
+# deployed app uses S3; without it, it falls back to a directory inside the
+# data volume, which still works but keeps notes on the instance.
+#
+# Lightsail has no IAM instance roles, which is why static credentials are
+# needed here rather than a role. The file holds a user scoped to
+# s3:PutObject/GetObject on one bucket prefix and nothing else.
+STORAGE_ENV=()
+if [[ -f .aws-app-credentials ]]; then
+  # shellcheck disable=SC1091
+  set -a; source .aws-app-credentials; set +a
+  if [[ -z "${S3_BUCKET:-}" || -z "${AWS_ACCESS_KEY_ID:-}" ]]; then
+    echo "WARNING: .aws-app-credentials is missing S3_BUCKET or AWS_ACCESS_KEY_ID." >&2
+    echo "         Falling back to local storage." >&2
+  else
+    STORAGE_ENV=(
+      -e "STORAGE_BACKEND=s3"
+      -e "S3_BUCKET=${S3_BUCKET}"
+      -e "S3_PREFIX=${S3_PREFIX:-session-notes}"
+      -e "AWS_REGION=${AWS_REGION:-ap-southeast-2}"
+      -e "AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}"
+      -e "AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}"
+    )
+    echo "==> Session notes -> s3://${S3_BUCKET}/${S3_PREFIX:-session-notes}"
+  fi
+fi
+if [[ ${#STORAGE_ENV[@]} -eq 0 ]]; then
+  STORAGE_ENV=(-e "STORAGE_BACKEND=local")
+  echo "==> Session notes -> local storage on the instance (no .aws-app-credentials)"
+fi
+
 SSH=(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15
      "${SSH_USER}@${PUBLIC_IP}")
 
@@ -128,10 +159,26 @@ docker build --tag '${IMAGE}' .
 
 docker volume inspect '${VOLUME}' >/dev/null 2>&1 || docker volume create '${VOLUME}' >/dev/null
 
-if docker ps -a --format '{{.Names}}' | grep -qx '${CONTAINER}'; then
-  echo "    replacing existing container"
-  docker rm -f '${CONTAINER}' >/dev/null
-fi
+# Clear out any previous application on this box. Port 80 can only have one
+# occupant, and the old images are worth reclaiming on a small disk.
+#
+# Data volumes are deliberately NOT removed: the recipe app's volume still
+# holds its database, so removing only the container and image leaves that
+# recoverable rather than destroying it.
+for old in meditrack pantry mealie; do
+  if docker ps -a --format '{{.Names}}' | grep -qx "\$old"; then
+    echo "    removing previous container: \$old"
+    docker rm -f "\$old" >/dev/null
+  fi
+done
+
+for repo in pantry mealie ghcr.io/mealie-recipes/mealie; do
+  ids=\$(docker images --filter "reference=\${repo}" --format '{{.ID}}' | sort -u)
+  if [ -n "\$ids" ]; then
+    echo "    removing previous images: \$repo"
+    echo "\$ids" | xargs -r docker rmi -f >/dev/null 2>&1 || true
+  fi
+done
 
 docker run -d \
   --name '${CONTAINER}' \
@@ -142,6 +189,7 @@ docker run -d \
   -e DATA_DIR=/data \
   -e SECRET_KEY='${SECRET_KEY}' \
   -e TZ='${TZ_NAME}' \
+  ${STORAGE_ENV[@]@Q} \
   '${IMAGE}'
 
 # Keep the two most recent images for rollback; drop the rest and the cache.

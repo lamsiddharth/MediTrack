@@ -19,7 +19,8 @@ RUN pip install --no-cache-dir \
       "sqlalchemy==2.0.44" \
       "python-multipart==0.0.20" \
       "itsdangerous==2.2.0" \
-      "bcrypt==5.0.0"
+      "bcrypt==5.0.0" \
+      "boto3==1.40.49"
 
 COPY meditrack ./meditrack
 
