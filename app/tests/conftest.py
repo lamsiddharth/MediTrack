@@ -43,9 +43,7 @@ def auth(client):
     """A client already signed in as the seeded account."""
     client.cookies.clear()
     response = client.post(
-        "/login",
-        data={"username": "admin", "password": "testpass123", "next": "/"},
-        follow_redirects=False,
+        "/api/auth/login", json={"username": "admin", "password": "testpass123"}
     )
-    assert response.status_code == 303, response.text
+    assert response.status_code == 200, response.text
     return client

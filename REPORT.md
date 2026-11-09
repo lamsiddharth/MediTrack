@@ -5,19 +5,26 @@
 | | |
 |---|---|
 | **Application** | MediTrack — hospital management system (patients, appointments, clinical records, billing) |
-| **Implementation** | Python 3.13, FastAPI, SQLAlchemy 2.0, server-rendered Jinja2 templates |
+| **Presentation tier** | React 19, TypeScript, Vite, served by nginx |
+| **Application tier** | Python 3.13, FastAPI, SQLAlchemy 2.0, JSON API |
 | **Cloud provider** | Amazon Web Services |
 | **Region** | `ap-southeast-2` — Asia Pacific (Sydney) |
 | **Availability Zones** | `ap-southeast-2a` (active), `ap-southeast-2b` (provisioned, idle) |
 | **Architecture** | Three tiers: public presentation, private application, private data |
 
-> **Status of this report.** The application is built, tested and running; the
+> **Status of this report.** Both tiers are built, tested and running, and the
 > S3 object storage tier is provisioned and verified against the live service.
-> The VPC, the two EC2 tiers and the RDS instance described in §3 are **designed
-> and scripted but not provisioned** — no compute or database resources have
-> been created. §5 states precisely which parts are which, and §6 reports
-> results only for what was actually executed. Nothing in this document claims
-> a measurement that was not taken.
+> The VPC, the separate EC2 instances and the RDS instance described in §3 are
+> **designed and scripted but not provisioned** — no compute or database
+> resources have been created.
+>
+> §3 describes the **designed** topology, in which the two tiers occupy
+> separate subnets. §3.8 describes the **as-deployed** topology, in which they
+> are co-located on a single instance as two containers to keep the running
+> cost to one machine. The two differ only in where the tiers run, not in how
+> they are separated; §3.8 gives the exact difference. §6 reports results only
+> for what was actually executed, and no measurement is claimed that was not
+> taken.
 
 ---
 
@@ -164,22 +171,72 @@ front of it.
 
 One `t3.micro` in `10.20.1.0/24`, AZ `ap-southeast-2a`, with an Elastic IP.
 
-It runs **nginx as a reverse proxy only**. It carries no application code, no
-database credentials and no AWS credentials. Its jobs are:
+It runs **nginx**, which does two things:
 
-1. Accept the public connection on port 80.
-2. Forward it to the application tier on port 9000.
-3. Act as the SSH bastion for administrative access to the private tier.
+1. **Serves the React application** — a static bundle of HTML, JavaScript and
+   CSS produced by Vite. These are files on disk; no application logic runs
+   here.
+2. **Reverse-proxies `/api/*`** to the application tier on port 9000.
 
-Concentrating public exposure in a component this thin is the point. If it is
-compromised, the attacker gains a proxy — not the database credentials, not the
-S3 keys, and not the clinical data.
+It also acts as the SSH bastion for administrative access to the private tier.
 
-A design note worth being explicit about: MediTrack is a **server-rendered**
-application, so HTML is produced by the application tier and passed through the
-proxy. This is not a browser-side single-page app calling a separate API. The
-"frontend" instance is the presentation and edge tier, not a separate
-client-side codebase. Describing it otherwise would misrepresent the system.
+It carries **no application code, no database credentials and no AWS
+credentials**. Concentrating public exposure in a component this thin is the
+point: if it is compromised, the attacker gains a proxy and a copy of
+JavaScript that is public anyway — not the database credentials, not the S3
+keys, and not the clinical data.
+
+#### Why the API must be proxied rather than exposed
+
+This is the part of the design a single-page application forces, and it is
+worth stating directly because it is easy to get wrong.
+
+React runs **in the user's browser**, not on the presentation instance. So when
+the application fetches `/api/patients`, that request originates from the
+user's machine, somewhere on the internet. The application tier is in a private
+subnet with no route to an Internet Gateway, so **the browser cannot reach it
+directly** — and should not be able to.
+
+Proxying resolves this. The browser only ever talks to the presentation tier,
+on one origin:
+
+```
+browser --> http://<elastic-ip>/              static React bundle   (files on nginx)
+browser --> http://<elastic-ip>/api/patients  proxied to 10.20.11.10:9000
+```
+
+Two consequences follow, both of which simplify the system:
+
+- **No CORS.** The bundle and the API share an origin, so there are no
+  cross-origin preflight requests and no `Access-Control-Allow-*` headers to
+  configure. Exposing the API on its own hostname would require all of that.
+- **Session cookies work, and are the safer choice.** Because the request is
+  same-origin, the `HttpOnly` session cookie is sent automatically. The common
+  SPA alternative — a bearer token in `localStorage` — is readable by any
+  script on the page, so a single cross-site scripting flaw leaks the session.
+  An `HttpOnly` cookie is not readable by scripts at all.
+
+The nginx configuration separates the two concerns and handles SPA routing:
+
+```nginx
+location /api/ {
+    proxy_pass http://meditrack_api;      # the private application tier
+    proxy_redirect off;                   # see note below
+}
+
+location / {
+    try_files $uri $uri/ /index.html;     # client-side routes
+}
+```
+
+`try_files … /index.html` matters: `/patients` is a React Router path, not a
+file. Without that fallback, refreshing the page on any route but `/` returns
+404 from nginx.
+
+`proxy_redirect off` also matters. An attachment download answers `307` with a
+presigned S3 URL. That redirect must reach the **browser**, so that S3 serves
+the file directly; if nginx followed it, every clinical document would be
+proxied through a `t3.micro`.
 
 `nginx` is configured (`infra/bootstrap-frontend.sh`) to pass through the
 original client details, because from the application's point of view every
@@ -201,7 +258,8 @@ is up" — which is the first question to ask during an incident.
 One `t3.micro` in `10.20.11.0/24`, AZ `ap-southeast-2a`. **No public IP
 address.**
 
-It runs the MediTrack container, published on port 9000. What makes this
+It runs the MediTrack **API** container, published on port 9000 — a FastAPI
+application serving JSON over 24 endpoints. It renders no HTML. What makes this
 instance private is not a firewall rule but the **absence of a route**: its
 subnet's route table has no entry pointing at the Internet Gateway. An inbound
 packet from the internet has no path to it. A security-group mistake alone
@@ -282,8 +340,8 @@ Internet Gateway, the NAT Gateway, or the public internet. Three ways to obtain
 that address, in increasing robustness:
 
 1. *Read the private IP after launch and substitute it into the nginx config.*
-   Simple, and what `infra/40-instances.sh` does. Brittle: replacing the
-   instance changes the address and the proxy must be reconfigured.
+   Simple. Brittle: replacing the instance changes the address and the proxy
+   must be reconfigured.
 2. *Use the VPC-provided internal DNS name* — for example
    `ip-10-20-11-23.ap-southeast-2.compute.internal`. This works because the VPC
    has `enableDnsSupport` and `enableDnsHostnames` set, and it is resolved by
@@ -329,25 +387,85 @@ ssh -J ec2-user@<frontend-elastic-ip> ec2-user@10.20.11.10
 
 ### 3.7 Request path, end to end
 
-A clinician opening a patient record:
+A clinician opening a patient record involves two distinct exchanges.
+
+**First load — static assets, served entirely by the presentation tier:**
 
 ```
-browser
-  --> HTTP :80 to Elastic IP
-  --> IGW --> public subnet --> nginx (frontend, 10.20.1.x)
-  --> proxy_pass --> private subnet --> app :9000 (backend, 10.20.11.10)
-      |
-      |-- SQL :5432 --> RDS (private, 2a)        patient, appointment, billing rows
-      |
-      '-- HTTPS via S3 Gateway Endpoint --> S3   note text and attachments
-  <-- rendered HTML back through nginx
+browser --> HTTP :80 to Elastic IP --> IGW --> nginx (10.20.1.x)
+        <-- index.html, index.js, index.css        (files on disk)
 ```
 
-An attachment download does **not** follow the return path. The application
-issues a 303 redirect to a short-lived presigned S3 URL and the browser fetches
-the object from S3 directly. The bucket stays private, and a large file never
-traverses either the application instance or the proxy — which matters on
-`t3.micro` instances.
+The application tier is not involved at all. React then boots in the browser
+and begins fetching data.
+
+**Each data request — proxied to the private tier:**
+
+```
+browser --> GET /api/patients/4 --> IGW --> nginx (10.20.1.x)
+        --> proxy_pass --> private subnet --> API :9000 (10.20.11.10)
+            |
+            |-- SQL :5432 ------------------> RDS (private, 2a)
+            |                                 patient, appointment, billing rows
+            '-- HTTPS via S3 Gateway Endpoint -> S3
+                                              note text and attachments
+        <-- JSON back through nginx
+```
+
+**An attachment download deliberately breaks that pattern.** The API answers
+`307` with a short-lived presigned S3 URL, and the browser fetches the object
+from S3 **directly**:
+
+```
+browser --> GET /api/.../attachment --> nginx --> API
+        <-- 307 Location: https://<bucket>.s3.ap-southeast-2.amazonaws.com/...
+browser --> GET that URL ----------------------> S3   (no AWS credentials in the browser)
+```
+
+The bucket stays private throughout — the URL is signed, time-limited, and
+grants access to one object. A clinical document therefore never traverses the
+application instance or the proxy, which matters when both are `t3.micro`.
+
+---
+
+### 3.8 As-deployed topology: both tiers on one instance
+
+§3.1–3.7 describe the designed topology. **What is actually deployed
+co-locates both tiers on a single EC2 instance**, as two containers on a
+private Docker bridge network. This is a cost decision: one `t3.micro` instead
+of two, and no NAT Gateway, which together account for most of the figure in
+§6.5.
+
+The separation is preserved rather than abandoned:
+
+| Property | Designed (two subnets) | As deployed (one instance) |
+|---|---|---|
+| Presentation tier | EC2 in public subnet | `web` container |
+| Application tier | EC2 in private subnet | `api` container |
+| Publishes a host port | frontend only, :80 | `web` only, :80 |
+| API reachable from internet | no — no IGW route | no — no published port |
+| API addressed as | `10.20.11.10:9000` | `api:9000` |
+| Isolation enforced by | route table | Docker network namespace |
+
+The boundary is real in both cases. In `docker-compose.yml` the `api` service
+has **no `ports:` block at all** — only `expose:` — so it is reachable on the
+bridge network by service name and from nowhere else, not even from the host
+itself. Port 80 on `web` is the single published port in the stack.
+
+What co-location genuinely costs is worth being straight about:
+
+- **The isolation is weaker.** A container namespace is a softer boundary than
+  a routing table in a different subnet. A container escape reaches the host
+  and therefore the other tier; a subnet has no route to cross.
+- **A single instance failure takes down both tiers**, rather than one.
+- **The tiers cannot be scaled or patched independently.**
+
+What makes the gap small is that nothing in either codebase assumes
+co-location. The frontend addresses the API by a configurable upstream
+(`API_UPSTREAM`), and the API binds a port and reads its configuration from the
+environment. Moving `api` to its own instance in a private subnet means
+changing `API_UPSTREAM` from `api:9000` to `10.20.11.10:9000` and running the
+`infra/` scripts. No application code changes.
 
 ---
 
@@ -456,20 +574,48 @@ here uses EC2 within a VPC rather than Lightsail.
 
 ## 5. Implementation
 
-### 5.1 Application — implemented and tested
+### 5.1 Application tier — implemented and tested
 
-Approximately 3,000 lines in `app/meditrack/` — 2,169 of Python and 869 of
-templates — plus 67 tests.
+A JSON API, in `app/meditrack/`.
 
 | Module | Responsibility |
 |---|---|
 | `models.py` | Six tables: `users`, `patients`, `doctors`, `appointments`, `consultations`, `session_notes` |
+| `schemas.py` | Pydantic request and response models — the contract with the client |
 | `db.py` | Engine and session handling; SQLite pragmas or PostgreSQL pooling by URL |
 | `security.py` | bcrypt hashing, session cookie, login dependency |
 | `storage.py` | Object-storage abstraction with `local` and `s3` drivers |
 | `seed.py` | Schema creation, login account, demo data |
-| `routes/` | `auth`, `dashboard`, `patients`, `doctors`, `appointments`, `consultations`, `notes` |
-| `templating.py` | Jinja2 environment and formatting filters |
+| `api/` | `auth`, `dashboard`, `patients`, `doctors`, `appointments`, `consultations`, `notes` |
+
+2,082 lines, 24 endpoints. Response schemas are deliberately separate from the SQLAlchemy
+models, so renaming a column cannot silently change the shape of a response.
+
+### 5.2 Presentation tier — implemented and tested
+
+A React single-page application, in `frontend/src/`.
+
+| Path | Responsibility |
+|---|---|
+| `lib/api.ts` | Fetch wrapper; extracts readable messages from FastAPI error bodies |
+| `lib/auth.tsx` | Session context; loads `/auth/me` and `/meta` on start |
+| `lib/types.ts` | TypeScript mirrors of the API schemas |
+| `lib/format.ts` | Date, time and currency formatting |
+| `components/` | `Layout` (nav shell) and shared UI primitives |
+| `pages/` | 13 route components |
+
+2,375 lines of TypeScript and TSX.
+
+Two details worth noting:
+
+- **Enumerations come from the server.** `GET /api/meta` returns the valid
+  sexes, appointment statuses, payment statuses, the slot length and the
+  attachment limits. The client renders dropdowns from that rather than
+  hard-coding values that could drift out of step with the backend.
+- **No `innerHTML` anywhere.** Multi-line clinical text is rendered by
+  splitting on newlines into React elements, so stored text cannot inject
+  markup. The server-rendered version needed an explicit escaping filter for
+  this; React's default escaping removes the whole class of problem.
 
 Functionality delivered:
 
@@ -501,7 +647,7 @@ Functionality delivered:
   cannot be used to enumerate usernames, and a `?next=` parameter restricted to
   relative paths so it cannot redirect off-site after login.
 
-### 5.2 Storage abstraction
+### 5.3 Storage abstraction
 
 Two drivers behind one interface (`storage.py`), selected by
 `STORAGE_BACKEND`:
@@ -514,7 +660,7 @@ Nothing above this module knows which is in use. This is what allowed the S3
 integration to be tested exhaustively offline against `moto`, and then verified
 separately against the real service.
 
-### 5.3 Infrastructure as scripts — written, not executed
+### 5.4 Infrastructure as scripts — written, not executed
 
 `infra/` contains idempotent provisioning scripts. **None have been run.** They
 are the configuration deliverable and the reproducible definition of §3:
@@ -532,30 +678,41 @@ Each script finds existing resources by `Name` tag and reuses them, so a partial
 run can be repeated safely. Resource IDs are recorded in `infra/state.env` for
 later scripts to consume.
 
-### 5.4 Container image
+### 5.5 Container images
 
-Single-stage, `python:3.13-slim`. The application is Python with server-rendered
-templates, so there is **no frontend build toolchain** — no Node, no bundler, no
-asset pipeline. The practical consequence is large: the image builds in a minute
-or two on a `t3.micro`, where a comparable application with a JavaScript build
-step needed roughly 4 GB of memory and tens of minutes on the same hardware.
+Two images, one per tier.
 
-The container runs as a non-root user (uid 10001) and declares a `HEALTHCHECK`
-against `/healthz`.
+**`api`** — single-stage `python:3.13-slim`. Runs as a non-root user (uid
+10001) and declares a `HEALTHCHECK` against `/healthz`.
 
-### 5.5 Deployment mechanism
+**`web`** — multi-stage. `node:22-alpine` installs dependencies with `npm ci`
+and runs `vite build`; the resulting `dist/` is copied into `nginx:1.27-alpine`
+and the Node stage is discarded. The runtime image therefore contains no Node,
+no `node_modules` and no build tooling — only static files and nginx.
+
+The frontend build is the one step that could have been a problem on a
+`t3.micro`, since JavaScript bundlers are memory-hungry. Measured locally it
+is not: **1.66 seconds, producing 267 kB of JavaScript (82 kB gzipped)**. The
+application is small enough that the bundler never approaches the memory
+ceiling. Dependencies are copied before source so that a source-only change
+reuses the `npm ci` layer.
+
+### 5.6 Deployment mechanism
 
 `deploy.sh` sends the source to the instance over SSH, builds the image there,
 and replaces the container. Notable properties:
 
-- **No container registry.** Only source crosses the network — under a megabyte,
-  rather than the several hundred a built image would be. Deployment is not
-  gated on upload bandwidth, and no registry has to be provisioned or paid for.
-- **No AWS credentials on the deploying machine's path into the instance.**
-- **Verification, not optimism.** It polls `/healthz` and exits non-zero if the
-  application does not become healthy, rather than reporting success because a
-  command returned.
-- **Data volumes are never removed**, so replacing the container cannot destroy
+- **No container registry.** Only source crosses the network — a few megabytes,
+  rather than the several hundred a pair of built images would be. Deployment is
+  not gated on upload bandwidth, and no registry has to be provisioned or paid
+  for.
+- **Secrets are assembled locally** and written to the instance's `.env` over
+  the SSH channel, so credentials never appear in a remote shell's history or
+  process list.
+- **Verification, not optimism.** It polls `/healthz` *and* confirms the SPA
+  shell is served on `/`, then exits non-zero if either fails — rather than
+  reporting success because a command returned.
+- **Data volumes are never removed**, so replacing containers cannot destroy
   the database.
 
 ---
@@ -564,24 +721,56 @@ and replaces the container. Notable properties:
 
 ### 6.1 What was executed and verified
 
-**Application test suite — 67 tests, all passing.**
+**Backend test suite — 73 tests, all passing.**
 
 ```
 $ cd app && uv run pytest -q
-...................................................................
-67 passed in 42.73s
+........................................................................
+73 passed in 44.92s
 ```
 
 Coverage is behavioural rather than incidental:
 
 | Area | Tests verify |
 |---|---|
-| Authentication | every page redirects when unauthenticated; wrong password rejected; unknown user and wrong password are indistinguishable; `?next=` cannot redirect off-site |
-| Patients | registration allocates sequential MRNs; future and malformed dates of birth rejected; search matches name, MRN and phone |
-| Appointments | booking succeeds; same doctor in the same slot refused; a 10-minute offset still refused as overlapping; a different doctor at the same time allowed; 25 minutes later allowed |
-| Consultations | diagnosis required; negative fee rejected; recording a visit completes its appointment |
-| Storage | local and S3 drivers round-trip; traversal in object keys and filenames neutralised; oversized and disallowed attachment types rejected; an attachment cannot be fetched through a different consultation |
-| Failure handling | a storage outage mid-write records no database row; a note whose object has vanished degrades in place rather than failing the page |
+| Authentication | every protected endpoint returns 401 unauthenticated; wrong password rejected; unknown user and wrong password are indistinguishable; login/`me`/logout cycle |
+| Metadata | `/meta` exposes the enumerations and limits the client renders from |
+| Patients | registration allocates sequential MRNs; future and malformed dates of birth rejected; unknown sex rejected; search matches name, MRN and phone |
+| Appointments | booking succeeds; same doctor in the same slot refused with 409; a 10-minute offset still refused as overlapping; a different doctor at the same time allowed; 25 minutes later allowed; **cancelling releases the slot** |
+| Consultations | blank diagnosis rejected; negative fee rejected; recording a visit completes its appointment; one consultation per appointment enforced; walk-ins need no booking |
+| Storage | local and S3 drivers round-trip; presigned URLs use the regional host; traversal in object keys and filenames neutralised; oversized and disallowed attachment types rejected; an attachment cannot be fetched through a different consultation |
+| Failure handling | a storage outage mid-write records no database row; a note whose object has vanished is reported `unavailable` rather than failing the response |
+
+**Frontend — type-checked and built.** `tsc --noEmit` passes with
+`strict`, `noUnusedLocals` and `noUnusedParameters` enabled. `vite build`
+produces 267 kB of JavaScript (82 kB gzipped) in 1.66 s.
+
+**Both tiers running together, verified through the proxy.** The backend on
+:9000 and the frontend on :5173, with `/api` proxied — the same request path
+nginx implements in production:
+
+```
+GET  /                      200    SPA shell from the presentation tier
+GET  /patients              200    client-side route, shell served
+GET  /api/auth/me           401    {"detail":"Not signed in"}
+POST /api/auth/login        200    session cookie set
+GET  /api/auth/me           200    ...and accepted on the next request
+GET  /api/dashboard         200
+GET  /api/consultations/1   200
+```
+
+The session cookie surviving the proxy hop is the specific thing being checked
+there: it is what makes same-origin cookie auth viable instead of a token.
+
+**The double-booking rule, through the full stack:**
+
+```
+POST /api/appointments  09:00  doctor 1  -> 201
+POST /api/appointments  09:10  doctor 1  -> 409
+  "That doctor already has Arjun Sharma booked at 09:00 on 20 Dec 2026.
+   Slots are 20 minutes long — pick another time."
+POST /api/appointments  09:00  doctor 2  -> 201
+```
 
 **S3 integration — verified against the live service.** Not mocked:
 
@@ -592,17 +781,26 @@ fetch via presigned URL    : OK
 content-disposition        : attachment; filename="Lab_Report.pdf"
 ```
 
-**End-to-end through the running application.** A progress note with a PDF
-attachment was added through the web interface. Both objects appeared in S3:
+**End-to-end through both tiers into real S3.** A progress note with a PDF
+attachment was submitted through the proxied API. Both objects appeared in the
+live bucket:
 
 ```
-session-notes/consultations/1/notes/5b596c1e.../body.txt                85 B
-session-notes/consultations/1/notes/5b596c1e.../attachment/bloods.pdf   48 B
+session-notes/consultations/1/notes/00ac36cc.../body.txt              44 B
+session-notes/consultations/1/notes/00ac36cc.../attachment/xray.pdf   47 B
 ```
 
-The note body was then read back from S3 and rendered on the consultation page,
-and the attachment downloaded via presigned URL matched the uploaded file byte
-for byte.
+The attachment download then behaved as designed — the API answered `307` to a
+**regional** presigned URL, and following it returned bytes identical to the
+upload:
+
+```
+app responds : 307
+redirect to  : https://meditrack-session-notes-808122334310
+                 .s3.ap-southeast-2.amazonaws.com/...signed
+final        : 200
+diff         : downloaded bytes match the upload
+```
 
 **Bucket configuration — confirmed by inspection:**
 
@@ -630,12 +828,20 @@ claim:
 
 | Component | Status |
 |---|---|
-| S3 bucket, IAM policy | **Provisioned and verified** |
-| Application, tests, local run | **Implemented and verified** |
+| S3 bucket, IAM policy | **Provisioned and verified against the live service** |
+| Application tier (API), 73 tests | **Implemented and verified** |
+| Presentation tier (React), typecheck and build | **Implemented and verified** |
+| Both tiers running together, proxied | **Verified locally** |
+| `docker-compose.yml`, both Dockerfiles | Written, **images not built** — no Docker available in this environment |
+| nginx configuration | Written, **not exercised** — the proxy path was verified through Vite's equivalent proxy instead |
 | VPC, subnets, IGW, NAT, routes | Scripted, **not provisioned** |
-| EC2 presentation and application tiers | Scripted, **not provisioned** |
+| EC2 instance(s) | Scripted, **not provisioned** |
 | RDS instance | Scripted, **not provisioned** |
-| nginx proxy configuration | Written, **not exercised against a live backend** |
+
+Two honest gaps in that list. The container images have never been built, so
+the Dockerfiles are unproven; and the nginx configuration has never served a
+request. The proxy *behaviour* was verified through Vite's dev proxy, which
+implements the same path-based forwarding, but that is not the same artefact.
 
 No latency, throughput or availability figures are reported, because no such
 measurement was taken. Any number here would be invented.
@@ -660,7 +866,23 @@ reached users:
    `Host` header, following the redirect invalidates the signature. Fixed with
    `addressing_style: "virtual"`.
 
-A fourth problem was environmental: **Cloudflare WARP intercepts outbound SSH**,
+Converting the server-rendered interface into a React client and a JSON API
+surfaced two more:
+
+4. **`model_validate(obj, update={...})` is not valid Pydantic v2.** `update` is
+   a parameter of `model_copy`, not `model_validate`. Fifteen tests failed with
+   a `TypeError` at once; the serialisers now construct their nested models
+   explicitly, which is clearer than the shortcut was.
+5. **A whitespace-only diagnosis passed validation.** `Field(min_length=1)` is
+   satisfied by `"   "`, so a consultation could be saved with a blank
+   diagnosis — the single most important field in the record. Required text
+   fields now strip before checking. This one is worth dwelling on: the
+   server-rendered version had `if not diagnosis.strip()` in the route, and
+   moving validation into the schema silently dropped the `.strip()`. A
+   refactor can lose a check that no test was watching, which is why the test
+   asserting a blank diagnosis is rejected now exists.
+
+A sixth problem was environmental: **Cloudflare WARP intercepts outbound SSH**,
 causing port 22 to time out, and simultaneously causes `checkip` to report a
 rotating Cloudflare address rather than the administrator's own — which would
 place the wrong `/32` in the administrative security-group rule.
@@ -692,25 +914,28 @@ remediation.
 
 `ap-southeast-2`, on-demand, excluding free-tier credits. Approximate.
 
-| Item | ~USD/month |
-|---|---|
-| EC2 `t3.micro` × 2 | 19 |
-| RDS `db.t4g.micro`, 20 GB gp3, single-AZ | 17 |
-| **NAT Gateway** (hourly + data processing) | **35** |
-| Elastic IPs × 2 (one attached, one on NAT) | 4 |
-| S3 storage and requests (low volume) | <1 |
-| EBS root volumes | 3 |
-| **Total** | **≈ 78** |
+| Item | Designed (two subnets) | As deployed (one instance) |
+|---|---|---|
+| EC2 `t3.micro` | 19 (× 2) | 9 (× 1) |
+| RDS `db.t4g.micro`, 20 GB gp3, single-AZ | 17 | 17 |
+| **NAT Gateway** (hourly + data processing) | **35** | **—** |
+| Elastic IPs | 4 (× 2) | 0 (one, attached) |
+| S3 storage and requests (low volume) | <1 | <1 |
+| EBS root volumes | 3 | 2 |
+| **Total** | **≈ 78** | **≈ 28** |
 
-The NAT Gateway is the largest single line — more than either compute tier.
-Two observations follow. First, the S3 Gateway Endpoint is not merely a
-networking nicety: it removes per-gigabyte NAT processing charges on the
-largest objects the system handles. Second, if cost mattered more than
-architectural cleanliness at this scale, a NAT *instance* on a `t3.nano`, or
-placing the application tier in the public subnet with no inbound rules, would
-each remove most of that line — at the price of self-managed NAT or a weaker
-isolation story respectively. The managed NAT Gateway was kept because the
-isolation property in §3.3 is the substance of this design.
+Co-locating the tiers removes roughly two thirds of the cost, and the NAT
+Gateway is most of it — there is no private subnet to give egress to. That
+saving is the reason for the as-deployed topology in §3.8, and §3.8 states what
+it costs in isolation strength.
+
+In the designed topology the NAT Gateway is the largest single line — more than
+both compute tiers together. The S3 Gateway Endpoint is therefore not merely a
+networking nicety: it removes per-gigabyte NAT processing charges on the largest
+objects the system handles. The alternatives for reducing it further — a NAT
+*instance* on a `t3.nano`, or putting the application tier in the public subnet
+with no inbound rules — trade either self-managed NAT or the isolation property
+of §3.3, which is the substance of the design.
 
 ---
 
@@ -724,8 +949,8 @@ scripts. Against the objectives of §2:
 
 | | Objective | Outcome |
 |---|---|---|
-| O1 | Deploy a working application | Application built and verified; VPC deployment scripted, not provisioned |
-| O2 | One public entry point | Achieved in design: only the public route table has an IGW route |
+| O1 | Deploy a working application | Both tiers built and verified running together; VPC deployment scripted, not provisioned |
+| O2 | One public entry point | **Achieved in both topologies**: one IGW route in the design, one published port as deployed |
 | O3 | App and database unreachable from the internet | Achieved in design: private subnets with NAT egress only |
 | O4 | Managed database | RDS PostgreSQL specified; application verified compatible |
 | O5 | Durable document storage | **Achieved and verified** — S3, private, versioned, encrypted |
@@ -803,22 +1028,31 @@ hospital-project/
 │   ├── 30-database.sh         RDS subnet group and instance
 │   ├── bootstrap-frontend.sh  nginx reverse proxy user-data
 │   └── bootstrap-backend.sh   Docker user-data
-└── app/
-    ├── Dockerfile             single-stage Python image
-    ├── pyproject.toml         pinned dependencies
-    ├── meditrack/
-    │   ├── config.py          environment configuration
-    │   ├── db.py              engine, session, per-dialect tuning
-    │   ├── models.py          six tables
-    │   ├── security.py        bcrypt and session auth
-    │   ├── storage.py         local and S3 object-storage drivers
-    │   ├── seed.py            schema, account, demo data
-    │   ├── main.py            application assembly
-    │   ├── templating.py      Jinja2 environment and filters
-    │   ├── routes/            seven route modules
-    │   ├── templates/         15 templates
-    │   └── static/style.css   stylesheet
-    └── tests/                 67 tests
+├── docker-compose.yml         both tiers, one instance (section 3.8)
+├── app/                       APPLICATION TIER
+│   ├── Dockerfile             single-stage Python image
+│   ├── pyproject.toml         pinned dependencies
+│   ├── meditrack/
+│   │   ├── config.py          environment configuration
+│   │   ├── db.py              engine, session, per-dialect tuning
+│   │   ├── models.py          six tables
+│   │   ├── schemas.py         Pydantic request/response contract
+│   │   ├── security.py        bcrypt and session auth
+│   │   ├── storage.py         local and S3 object-storage drivers
+│   │   ├── seed.py            schema, account, demo data
+│   │   ├── main.py            application assembly
+│   │   └── api/               seven routers, 24 endpoints
+│   └── tests/                 73 tests
+└── frontend/                  PRESENTATION TIER
+    ├── Dockerfile             node build stage, nginx runtime stage
+    ├── nginx/default.conf     static serving, /api proxy, SPA fallback
+    ├── package.json           pinned dependencies
+    ├── vite.config.ts         build and dev-proxy configuration
+    └── src/
+        ├── lib/               api client, auth context, types, formatting
+        ├── components/        layout and UI primitives
+        ├── pages/             13 route components
+        └── styles.css         stylesheet
 ```
 
 ## Appendix B — Configuration reference
@@ -849,31 +1083,54 @@ local run.
 
 Full detail is in `README.md`. In brief:
 
-**Run locally** (no AWS account needed):
+**Run locally** — two processes, no AWS account needed.
+
+Terminal 1, the application tier:
 
 ```bash
 cd app
 uv venv && uv pip install -e '.[dev]'
-uv run uvicorn meditrack.main:app --reload --port 8000
+uv run uvicorn meditrack.main:app --reload --port 9000
 ```
 
-Open <http://127.0.0.1:8000> and sign in with `admin` / `admin123`.
+Terminal 2, the presentation tier:
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Open <http://127.0.0.1:5173> and sign in with `admin` / `admin123`. Vite
+proxies `/api` to port 9000, which is the same path-based forwarding nginx
+performs in the deployed stack, so the session cookie behaves identically.
 
 **Run the tests:**
 
 ```bash
-cd app && uv run pytest -q          # 67 tests
+cd app      && uv run pytest -q     # 73 tests
+cd frontend && npm run typecheck    # strict TypeScript
+cd frontend && npm run build        # production bundle
 ```
 
-**Run locally against the real S3 bucket:**
+**Run locally against the real S3 bucket** — add to terminal 1:
 
 ```bash
-cd app
 AWS_PROFILE=new AWS_REGION=ap-southeast-2 \
 STORAGE_BACKEND=s3 \
 S3_BUCKET=meditrack-session-notes-808122334310 \
-uv run uvicorn meditrack.main:app --port 8000
+uv run uvicorn meditrack.main:app --port 9000
 ```
+
+**Run both tiers as the deployed stack** (requires Docker):
+
+```bash
+echo "SECRET_KEY=$(head -c 32 /dev/urandom | base64 | tr -d '=+/')" > .env
+docker compose up -d --build
+```
+
+Open <http://127.0.0.1>. Only `web` publishes a port; `api` is reachable only
+on the compose network.
 
 **Provision the three-tier architecture** — note that these have not been run,
 and that a NAT Gateway and RDS instance begin incurring charges immediately:

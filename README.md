@@ -5,7 +5,9 @@ Docker. Written for this project rather than vendored from elsewhere.
 
 | | |
 |---|---|
-| **Application** | MediTrack — Python / FastAPI, server-rendered HTML, SQLite |
+| **Presentation tier** | React 19 + TypeScript (Vite), served by nginx |
+| **Application tier** | Python / FastAPI JSON API, SQLAlchemy |
+| **Database** | SQLite by default; PostgreSQL / RDS via `DATABASE_URL` |
 | **Image delivery** | Source sent to the instance over SSH and built there. No registry, no local Docker. |
 | **Session notes** | Stored in S3 (`meditrack-session-notes-808122334310`, ap-southeast-2) |
 | **Cloud** | AWS EC2 — `t3.micro`, Amazon Linux 2023 |
@@ -73,27 +75,61 @@ to start genuinely empty.
 
 | Path | Purpose |
 |---|---|
-| `app/meditrack/` | The application. `models.py`, `routes/`, `templates/`, `seed.py`. |
-| `app/Dockerfile` | Single-stage Python image. No frontend toolchain. |
-| `app/tests/` | 33 tests covering the login gate, every page, and the booking and validation rules. |
-| `bootstrap.sh` | Instance user-data. Swap and Docker. Pass it verbatim; needs no credentials. |
-| `deploy.sh` | Sends `app/` to the instance, builds the image there, starts the container, verifies health. |
+| `app/` | **Application tier**: FastAPI JSON API, 24 endpoints. `models.py`, `schemas.py`, `api/`, `storage.py`. |
+| `app/tests/` | 73 tests covering the auth gate, every resource, and the booking and validation rules. |
+| `frontend/` | **Presentation tier**: React SPA plus the nginx configuration that serves it and proxies `/api`. |
+| `docker-compose.yml` | Runs both tiers on one instance as two containers. |
+| `infra/` | Scripts for the two-subnet VPC architecture in `REPORT.md` §3. Not run. |
+| `bootstrap.sh` | Instance user-data. Swap, Docker, Compose plugin. Pass it verbatim; needs no credentials. |
+| `deploy.sh` | Sends both tiers to the instance, builds there, starts the stack, verifies health. |
+| `REPORT.md` | Project report: problem, objectives, architecture, services, implementation, results. |
 
 ---
 
 ## Running it locally
 
+Two processes. **Terminal 1** — the application tier (JSON API) on port 9000:
+
 ```bash
 cd app
 uv venv && uv pip install -e '.[dev]'
-uv run uvicorn meditrack.main:app --reload --port 8000
+uv run uvicorn meditrack.main:app --reload --port 9000
 ```
 
-Open <http://127.0.0.1:8000> and sign in with `admin` / `admin123`.
-The database is created at `app/data/meditrack.db`.
+**Terminal 2** — the presentation tier (React) on port 5173:
 
 ```bash
-uv run pytest            # 33 tests
+cd frontend
+npm install
+npm run dev
+```
+
+Open <http://127.0.0.1:5173> and sign in with `admin` / `admin123`.
+The database is created at `app/data/meditrack.db`.
+
+Vite proxies `/api` to port 9000. That is the same path-based forwarding nginx
+does in the deployed stack, so the session cookie works identically in both —
+there is no CORS configuration in development that would not exist in
+production.
+
+### Or run both as the deployed stack
+
+Requires Docker:
+
+```bash
+echo "SECRET_KEY=$(head -c 32 /dev/urandom | base64 | tr -d '=+/')" > .env
+docker compose up -d --build
+```
+
+Open <http://127.0.0.1>. Only the `web` container publishes a port; `api` is
+reachable only on the compose network.
+
+### Tests
+
+```bash
+cd app      && uv run pytest -q     # 73 tests
+cd frontend && npm run typecheck    # strict TypeScript
+cd frontend && npm run build        # production bundle
 ```
 
 ## Configuration
@@ -297,10 +333,16 @@ change it. The instance is publicly reachable on port 80.
 ```bash
 IP="$(cat .static-ip)"
 ssh -i ~/.ssh/meditrack-key.pem ec2-user@"$IP"
+cd ~/meditrack
 
-docker ps
-docker logs -f meditrack
-docker stats --no-stream
+sudo docker compose ps              # both tiers and their health
+sudo docker compose logs -f api     # application logs
+sudo docker compose logs -f web     # nginx access and error logs
+sudo docker stats --no-stream
+
+# The API is not reachable from the host, by design. To reach it:
+sudo docker compose exec api python -c \
+  "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:9000/healthz').read())"
 ```
 
 Back up the database:
@@ -319,9 +361,13 @@ scp -i ~/.ssh/meditrack-key.pem ec2-user@"$IP":/tmp/meditrack-backup.tar.gz .
 ./deploy.sh
 ```
 
-Rebuilds and replaces the container. The `meditrack-data` volume is untouched,
-so the database survives. The two most recent images are kept, so you can roll
-back by name without rebuilding.
+Re-sends both tiers, rebuilds them on the instance and recreates the stack.
+The `meditrack-data` volume is untouched, so the database survives.
+
+Docker's layer cache lives on the instance, so an incremental change rebuilds
+faster than the first run. A change under `frontend/src/` re-runs the Vite
+build but reuses the `npm ci` layer; a change under `app/meditrack/` reuses the
+pip layer.
 
 ## Tearing down
 

@@ -19,7 +19,8 @@ if [ ! -f /swapfile ]; then
   echo '/swapfile none swap sw 0 0' >> /etc/fstab
 fi
 
-dnf install -y docker tar gzip
+# docker-compose-plugin: both tiers run as a two-container stack.
+dnf install -y docker docker-compose-plugin tar gzip
 systemctl enable --now docker
 
 # Lets the login user run docker without sudo after the next login. deploy.sh

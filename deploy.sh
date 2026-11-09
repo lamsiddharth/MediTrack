@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Send the application source to the instance, build the image there, and run it.
+# Send the source to the instance, build both tiers there, and start them.
 #
 # No container registry, and no Docker needed on this machine. Only the source
-# is transferred, which is well under a megabyte.
+# is transferred, which is a few megabytes.
 #
 # Usage:
 #   ./deploy.sh                      # uses .static-ip and a key from ~/.ssh
@@ -13,11 +13,7 @@
 set -euo pipefail
 
 SSH_USER="${SSH_USER:-ec2-user}"
-TAG="${IMAGE_TAG:-$(date -u +%Y%m%d-%H%M%S)}"
-IMAGE="meditrack:${TAG}"
-CONTAINER="meditrack"
-VOLUME="meditrack-data"
-REMOTE_DIR="/home/${SSH_USER}/meditrack-src"
+REMOTE_DIR="/home/${SSH_USER}/meditrack"
 TZ_NAME="${TZ_NAME:-Asia/Kolkata}"
 
 # ---------------------------------------------------------------------------
@@ -55,42 +51,11 @@ else
   echo "==> Generated .secret-key (keep it; it is gitignored)"
 fi
 
-# Object storage for session notes. With .aws-app-credentials present the
-# deployed app uses S3; without it, it falls back to a directory inside the
-# data volume, which still works but keeps notes on the instance.
-#
-# Lightsail has no IAM instance roles, which is why static credentials are
-# needed here rather than a role. The file holds a user scoped to
-# s3:PutObject/GetObject on one bucket prefix and nothing else.
-STORAGE_ENV=()
-if [[ -f .aws-app-credentials ]]; then
-  # shellcheck disable=SC1091
-  set -a; source .aws-app-credentials; set +a
-  if [[ -z "${S3_BUCKET:-}" || -z "${AWS_ACCESS_KEY_ID:-}" ]]; then
-    echo "WARNING: .aws-app-credentials is missing S3_BUCKET or AWS_ACCESS_KEY_ID." >&2
-    echo "         Falling back to local storage." >&2
-  else
-    STORAGE_ENV=(
-      -e "STORAGE_BACKEND=s3"
-      -e "S3_BUCKET=${S3_BUCKET}"
-      -e "S3_PREFIX=${S3_PREFIX:-session-notes}"
-      -e "AWS_REGION=${AWS_REGION:-ap-southeast-2}"
-      -e "AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}"
-      -e "AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}"
-    )
-    echo "==> Session notes -> s3://${S3_BUCKET}/${S3_PREFIX:-session-notes}"
-  fi
-fi
-if [[ ${#STORAGE_ENV[@]} -eq 0 ]]; then
-  STORAGE_ENV=(-e "STORAGE_BACKEND=local")
-  echo "==> Session notes -> local storage on the instance (no .aws-app-credentials)"
-fi
-
 SSH=(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15
      "${SSH_USER}@${PUBLIC_IP}")
 
 echo "==> Target : ${SSH_USER}@${PUBLIC_IP}"
-echo "==> Image  : ${IMAGE}  (built on the instance)"
+echo "==> Tiers  : web (nginx + React) and api (FastAPI), built on the instance"
 echo
 
 # ---------------------------------------------------------------------------
@@ -118,21 +83,30 @@ if ! "${SSH[@]}" 'command -v docker >/dev/null && sudo systemctl is-active --qui
   exit 1
 fi
 
+if ! "${SSH[@]}" 'docker compose version >/dev/null 2>&1 || sudo docker compose version >/dev/null 2>&1'; then
+  echo "The Docker Compose plugin is missing on the instance." >&2
+  echo "bootstrap.sh installs it; on an older instance run:" >&2
+  echo "  sudo dnf install -y docker-compose-plugin" >&2
+  exit 1
+fi
+
 DISK_GB="$("${SSH[@]}" "df -BG --output=avail / | tail -1 | tr -dc '0-9'" || echo 0)"
 echo "    ${DISK_GB}GB free disk"
-if (( DISK_GB < 3 )); then
-  echo "Only ${DISK_GB}GB free; need ~3GB for the Python base image and build." >&2
+if (( DISK_GB < 5 )); then
+  echo "Only ${DISK_GB}GB free; the node and python base images need ~5GB." >&2
   echo "  ssh -i $SSH_KEY ${SSH_USER}@${PUBLIC_IP} 'sudo docker system prune -af'" >&2
   exit 1
 fi
 
 # ---------------------------------------------------------------------------
-# 2. Send the source
+# 2. Send the source for both tiers
 # ---------------------------------------------------------------------------
 echo "==> Transferring source"
 "${SSH[@]}" "rm -rf '${REMOTE_DIR}' && mkdir -p '${REMOTE_DIR}'"
 
 tar czf - \
+  --exclude='node_modules' \
+  --exclude='dist' \
   --exclude='__pycache__' \
   --exclude='*.pyc' \
   --exclude='.venv' \
@@ -142,29 +116,62 @@ tar czf - \
   --exclude='*.db' \
   --exclude='*.db-wal' \
   --exclude='*.db-shm' \
-  -C app . \
+  --exclude='*.tsbuildinfo' \
+  app frontend docker-compose.yml \
   | "${SSH[@]}" "tar xzf - -C '${REMOTE_DIR}'"
 
 echo "    sent $("${SSH[@]}" "du -sh '${REMOTE_DIR}' | cut -f1")"
 
 # ---------------------------------------------------------------------------
-# 3. Build and run
+# 3. Write the environment file on the instance
 # ---------------------------------------------------------------------------
-echo "==> Building and starting (a minute or two)"
+# Built locally so credentials are never echoed into the remote shell's
+# history or process list.
+ENV_CONTENT="SECRET_KEY=${SECRET_KEY}
+TZ_NAME=${TZ_NAME}
+"
+if [[ -f .aws-app-credentials ]]; then
+  # shellcheck disable=SC1091
+  set -a; source .aws-app-credentials; set +a
+  if [[ -n "${S3_BUCKET:-}" && -n "${AWS_ACCESS_KEY_ID:-}" ]]; then
+    ENV_CONTENT+="STORAGE_BACKEND=s3
+S3_BUCKET=${S3_BUCKET}
+S3_PREFIX=${S3_PREFIX:-session-notes}
+AWS_REGION=${AWS_REGION:-ap-southeast-2}
+AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+"
+    echo "==> Session notes -> s3://${S3_BUCKET}/${S3_PREFIX:-session-notes}"
+  else
+    ENV_CONTENT+="STORAGE_BACKEND=local
+"
+    echo "WARNING: .aws-app-credentials incomplete; using local storage." >&2
+  fi
+else
+  ENV_CONTENT+="STORAGE_BACKEND=local
+"
+  echo "==> Session notes -> local storage on the instance (no .aws-app-credentials)"
+fi
+
+if [[ -f .database-url ]]; then
+  ENV_CONTENT+="DATABASE_URL=$(tr -d '[:space:]' < .database-url)
+"
+  echo "==> Database -> RDS (from .database-url)"
+else
+  echo "==> Database -> SQLite in the data volume (no .database-url)"
+fi
+
+printf '%s' "$ENV_CONTENT" | "${SSH[@]}" "cat > '${REMOTE_DIR}/.env' && chmod 600 '${REMOTE_DIR}/.env'"
+
+# ---------------------------------------------------------------------------
+# 4. Build and start both tiers
+# ---------------------------------------------------------------------------
+echo "==> Building and starting (first run pulls base images; allow a few minutes)"
 "${SSH[@]}" "sudo bash -s" <<REMOTE
 set -euo pipefail
-
 cd '${REMOTE_DIR}'
-docker build --tag '${IMAGE}' .
 
-docker volume inspect '${VOLUME}' >/dev/null 2>&1 || docker volume create '${VOLUME}' >/dev/null
-
-# Clear out any previous application on this box. Port 80 can only have one
-# occupant, and the old images are worth reclaiming on a small disk.
-#
-# Data volumes are deliberately NOT removed: the recipe app's volume still
-# holds its database, so removing only the container and image leaves that
-# recoverable rather than destroying it.
+# Clear anything from a previous application that would hold port 80.
 for old in meditrack pantry mealie; do
   if docker ps -a --format '{{.Names}}' | grep -qx "\$old"; then
     echo "    removing previous container: \$old"
@@ -172,43 +179,25 @@ for old in meditrack pantry mealie; do
   fi
 done
 
-for repo in pantry mealie ghcr.io/mealie-recipes/mealie; do
-  ids=\$(docker images --filter "reference=\${repo}" --format '{{.ID}}' | sort -u)
-  if [ -n "\$ids" ]; then
-    echo "    removing previous images: \$repo"
-    echo "\$ids" | xargs -r docker rmi -f >/dev/null 2>&1 || true
-  fi
-done
+docker compose up -d --build --remove-orphans
+docker image prune -f >/dev/null 2>&1 || true
 
-docker run -d \
-  --name '${CONTAINER}' \
-  --restart=always \
-  -p 80:9000 \
-  --memory=512m \
-  -v '${VOLUME}':/data \
-  -e DATA_DIR=/data \
-  -e SECRET_KEY='${SECRET_KEY}' \
-  -e TZ='${TZ_NAME}' \
-  ${STORAGE_ENV[@]@Q} \
-  '${IMAGE}'
-
-# Keep the two most recent images for rollback; drop the rest and the cache.
-docker images --format '{{.Repository}}:{{.Tag}}' \
-  | grep '^meditrack:' \
-  | tail -n +3 \
-  | xargs -r -n1 docker rmi -f >/dev/null 2>&1 || true
-docker builder prune -af >/dev/null 2>&1 || true
+echo "    containers:"
+docker compose ps --format '      {{.Service}}  {{.Status}}  {{.Ports}}'
 REMOTE
 
 # ---------------------------------------------------------------------------
-# 4. Verify
+# 5. Verify
 # ---------------------------------------------------------------------------
 echo "==> Waiting for the application to answer"
 for _ in $(seq 1 40); do
   if [[ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://${PUBLIC_IP}/healthz" || true)" == "200" ]]; then
+    # The SPA shell must also be served, not just the proxied API.
+    shell="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://${PUBLIC_IP}/" || true)"
     echo
     echo "Deployed.  http://${PUBLIC_IP}/"
-    echo "Image:     ${IMAGE}"
+    echo "  api  : healthy"
+    echo "  web  : HTTP ${shell} on /"
     echo
     echo "Sign in with admin / admin123, then change the password from the"
     echo "Account page. The instance is publicly reachable on port 80."
@@ -218,6 +207,6 @@ for _ in $(seq 1 40); do
 done
 
 echo >&2
-echo "The application did not become healthy within two minutes. Check:" >&2
-echo "  ssh -i $SSH_KEY ${SSH_USER}@${PUBLIC_IP} 'sudo docker logs ${CONTAINER}'" >&2
+echo "The stack did not become healthy within two minutes. Check:" >&2
+echo "  ssh -i $SSH_KEY ${SSH_USER}@${PUBLIC_IP} 'cd ${REMOTE_DIR} && sudo docker compose logs --tail=50'" >&2
 exit 1

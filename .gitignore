@@ -29,3 +29,6 @@ deployed.txt
 
 # Resource IDs recorded by infra scripts
 infra/state.env
+
+# RDS connection string, if used
+.database-url

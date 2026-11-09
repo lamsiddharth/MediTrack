@@ -1,15 +1,26 @@
 #!/bin/bash
 # User-data for the PUBLIC instance (presentation tier).
 #
-# Installs nginx as a reverse proxy. This instance holds no application code,
-# no database credentials and no AWS credentials: it terminates the public
-# connection and forwards to the private application tier.
+# Installs Docker and the Compose plugin. The presentation tier runs as the
+# `web` container: nginx serving the built React bundle and reverse-proxying
+# /api to the private application tier.
 #
-# __BACKEND_HOST__ is substituted by infra/40-instances.sh once the backend's
-# private address is known.
+# This instance holds no application logic, no database credentials and no AWS
+# credentials. The React bundle it serves is public by nature.
+#
+# __BACKEND_HOST__ must be substituted with the application tier's private
+# address before this is passed as user-data. With the fixed private IP
+# recommended in REPORT.md section 3.6 that is a constant, e.g. 10.20.11.10.
 set -eux
 
-dnf install -y nginx
+dnf install -y docker docker-compose-plugin tar gzip
+systemctl enable --now docker
+usermod -aG docker ec2-user || true
+
+# The nginx configuration below is what frontend/Dockerfile bakes into the web
+# image; it is reproduced here for the case where nginx is run directly on the
+# host rather than in a container.
+dnf install -y nginx || true
 
 cat > /etc/nginx/conf.d/meditrack.conf <<'NGINX'
 upstream meditrack_backend {

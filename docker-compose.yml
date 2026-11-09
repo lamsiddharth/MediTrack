@@ -1,0 +1,71 @@
+# Both tiers on one EC2 instance.
+#
+# The designed architecture (REPORT.md section 3) places these in separate
+# subnets: the presentation tier public, the application tier private. They are
+# co-located here to keep the running cost to a single instance. The split is
+# preserved as two containers on a private bridge network, so the boundary is
+# real rather than notional:
+#
+#   - only `web` publishes a port to the host, and therefore to the internet
+#   - `api` is reachable only on the compose network, by service name
+#   - moving `api` to its own instance changes API_UPSTREAM and nothing else
+#
+# Usage:  docker compose up -d --build
+
+name: meditrack
+
+services:
+  web:
+    build: ./frontend
+    image: meditrack-web:latest
+    restart: always
+    # The only published port in the stack.
+    ports:
+      - "80:80"
+    environment:
+      # Substituted into the nginx upstream block at container start.
+      API_UPSTREAM: api:9000
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - meditrack
+
+  api:
+    build: ./app
+    image: meditrack-api:latest
+    restart: always
+    # Deliberately no `ports:` block. The application tier is not reachable
+    # from the host or the internet, only from `web` over the bridge network.
+    expose:
+      - "9000"
+    environment:
+      DATA_DIR: /data
+      SECRET_KEY: ${SECRET_KEY:?set SECRET_KEY in .env}
+      TZ: ${TZ_NAME:-Asia/Kolkata}
+      # Session notes in S3. Falls back to local storage if unset.
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-local}
+      S3_BUCKET: ${S3_BUCKET:-}
+      S3_PREFIX: ${S3_PREFIX:-session-notes}
+      AWS_REGION: ${AWS_REGION:-ap-southeast-2}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      # Point at RDS to use PostgreSQL instead of the bundled SQLite file.
+      DATABASE_URL: ${DATABASE_URL:-}
+    volumes:
+      - meditrack-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:9000/healthz', timeout=4).status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - meditrack
+
+volumes:
+  meditrack-data:
+
+networks:
+  meditrack:
+    driver: bridge
