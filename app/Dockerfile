@@ -20,7 +20,8 @@ RUN pip install --no-cache-dir \
       "python-multipart==0.0.20" \
       "itsdangerous==2.2.0" \
       "bcrypt==5.0.0" \
-      "boto3==1.40.49"
+      "boto3==1.40.49" \
+      "psycopg[binary]==3.2.12"
 
 COPY meditrack ./meditrack
 

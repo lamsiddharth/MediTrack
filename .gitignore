@@ -23,3 +23,9 @@ deployed.txt
 
 # Static AWS credentials for the app (Lightsail has no instance roles)
 .aws-app-credentials
+
+# Generated RDS password
+.db-password
+
+# Resource IDs recorded by infra scripts
+infra/state.env
