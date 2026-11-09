@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+{% set nav = 'appointments' %}
+{% block title %}Appointments{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Appointments</h1>
+    <p class="muted">{{ day | date('%A, %d %B %Y') }}{% if day == today %} · today{% endif %}</p>
+  </div>
+  <div class="actions"><a class="btn primary" href="/appointments/new">Book appointment</a></div>
+</div>
+
+<div class="daynav">
+  <a class="btn small" href="/appointments?on={{ prev_day.isoformat() }}&status={{ selected_status }}">&larr; {{ prev_day | date('%d %b') }}</a>
+  <a class="btn small {{ 'ghost' if day == today }}" href="/appointments">Today</a>
+  <a class="btn small" href="/appointments?on={{ next_day.isoformat() }}&status={{ selected_status }}">{{ next_day | date('%d %b') }} &rarr;</a>
+
+  <form method="get" action="/appointments" class="inline">
+    <input type="hidden" name="on" value="{{ day.isoformat() }}">
+    <select name="status" onchange="this.form.submit()">
+      <option value="">All statuses</option>
+      {% for s in statuses %}
+      <option value="{{ s.value }}" {{ 'selected' if selected_status == s.value }}>{{ s.value }}</option>
+      {% endfor %}
+    </select>
+    <noscript><button class="btn small">Filter</button></noscript>
+  </form>
+</div>
+
+<section class="card">
+  {% if appointments %}
+  <table>
+    <thead><tr><th>Time</th><th>Patient</th><th>Doctor</th><th>Reason</th><th>Status</th><th></th></tr></thead>
+    <tbody>
+      {% for a in appointments %}
+      <tr>
+        <td class="nowrap">{{ a.scheduled_at | time }}</td>
+        <td>
+          <a href="/patients/{{ a.patient.id }}">{{ a.patient.full_name }}</a>
+          <br><span class="muted small mono">{{ a.patient.mrn }}</span>
+        </td>
+        <td>{{ a.doctor.full_name }}<br><span class="muted small">{{ a.doctor.specialisation }}</span></td>
+        <td>{{ a.reason or '—' }}</td>
+        <td><span class="pill s-{{ a.status.name }}">{{ a.status.value }}</span></td>
+        <td class="right nowrap">
+          {% if a.status.name == 'scheduled' %}
+            <a class="btn small primary" href="/consultations/new?appointment_id={{ a.id }}">Record visit</a>
+            <form method="post" action="/appointments/{{ a.id }}/status" class="inline">
+              <input type="hidden" name="status" value="No show">
+              <button class="btn small ghost">No show</button>
+            </form>
+            <form method="post" action="/appointments/{{ a.id }}/status" class="inline">
+              <input type="hidden" name="status" value="Cancelled">
+              <button class="btn small ghost">Cancel</button>
+            </form>
+          {% elif a.consultation %}
+            <a class="btn small ghost" href="/consultations/{{ a.consultation.id }}">View record</a>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty">Nothing booked for this day{% if selected_status %} with status “{{ selected_status }}”{% endif %}.</p>
+  {% endif %}
+</section>
+{% endblock %}

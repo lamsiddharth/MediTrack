@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}{{ app_name }}{% endblock %} · {{ app_name }}</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+{% if user %}
+<header class="topbar">
+  <a class="brand" href="/">{{ app_name }}</a>
+  <nav>
+    <a href="/" class="{{ 'on' if nav == 'dashboard' }}">Dashboard</a>
+    <a href="/patients" class="{{ 'on' if nav == 'patients' }}">Patients</a>
+    <a href="/appointments" class="{{ 'on' if nav == 'appointments' }}">Appointments</a>
+    <a href="/consultations" class="{{ 'on' if nav == 'consultations' }}">Records</a>
+    <a href="/doctors" class="{{ 'on' if nav == 'doctors' }}">Doctors</a>
+  </nav>
+  <div class="who">
+    <a href="/account" title="Account">{{ user.full_name }}</a>
+    <form method="post" action="/logout"><button class="link">Sign out</button></form>
+  </div>
+</header>
+{% endif %}
+
+<main{% if not user %} class="centered"{% endif %}>
+  {% block content %}{% endblock %}
+</main>
+
+<footer class="foot">
+  {{ app_name }} · demonstration system · synthetic data only
+</footer>
+</body>
+</html>

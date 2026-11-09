@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% set nav = 'consultations' %}
+{% block title %}Records{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Consultation records</h1>
+    <p class="muted">{{ consultations | length }} shown{% if only_unpaid %} · unpaid only{% endif %}</p>
+  </div>
+  <div class="actions">
+    <a class="btn primary" href="/consultations/new">Record visit</a>
+    {% if only_unpaid %}
+      <a class="btn ghost" href="/consultations">Show all</a>
+    {% else %}
+      <a class="btn ghost" href="/consultations?unpaid=1">Unpaid only</a>
+    {% endif %}
+  </div>
+</div>
+
+<section class="card">
+  {% if consultations %}
+  <table>
+    <thead><tr><th>Date</th><th>Patient</th><th>Doctor</th><th>Diagnosis</th><th class="right">Fee</th><th>Payment</th></tr></thead>
+    <tbody>
+      {% for c in consultations %}
+      <tr>
+        <td class="nowrap">{{ c.visited_at | date }}</td>
+        <td><a href="/patients/{{ c.patient.id }}">{{ c.patient.full_name }}</a></td>
+        <td>{{ c.doctor.full_name }}</td>
+        <td><a href="/consultations/{{ c.id }}">{{ c.diagnosis | truncate(56) }}</a></td>
+        <td class="right">{{ c.fee | money }}</td>
+        <td><span class="pill p-{{ c.payment_status.name }}">{{ c.payment_status.value }}</span></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty">{% if only_unpaid %}Nothing outstanding.{% else %}No consultations recorded yet.{% endif %}</p>
+  {% endif %}
+</section>
+{% endblock %}

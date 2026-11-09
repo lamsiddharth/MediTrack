@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}Account{% endblock %}
+
+{% block content %}
+<div class="page-head"><div><h1>Account</h1><p class="muted">{{ user.username }}</p></div></div>
+
+{% if error %}<p class="alert error">{{ error }}</p>{% endif %}
+{% if ok %}<p class="alert ok">{{ ok }}</p>{% endif %}
+
+<div class="two-col">
+  <section class="card">
+    <h2>Details</h2>
+    <dl class="kv">
+      <dt>Name</dt><dd>{{ user.full_name }}</dd>
+      <dt>Username</dt><dd class="mono">{{ user.username }}</dd>
+      <dt>Last signed in</dt><dd>{{ user.last_login_at | datetime }}</dd>
+    </dl>
+  </section>
+
+  <section class="card">
+    <h2>Change password</h2>
+    <form method="post" action="/account/password">
+      <label for="current_password">Current password</label>
+      <input id="current_password" name="current_password" type="password"
+             autocomplete="current-password" required>
+
+      <label for="new_password">New password</label>
+      <input id="new_password" name="new_password" type="password"
+             autocomplete="new-password" minlength="8" required>
+
+      <label for="confirm_password">Confirm new password</label>
+      <input id="confirm_password" name="confirm_password" type="password"
+             autocomplete="new-password" minlength="8" required>
+
+      <div class="form-actions">
+        <button type="submit" class="primary">Change password</button>
+      </div>
+    </form>
+    <p class="hint">At least 8 characters.</p>
+  </section>
+</div>
+{% endblock %}

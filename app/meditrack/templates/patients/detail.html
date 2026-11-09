@@ -1,0 +1,78 @@
+{% extends "base.html" %}
+{% set nav = 'patients' %}
+{% block title %}{{ patient.full_name }}{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>{{ patient.full_name }}</h1>
+    <p class="muted">
+      <span class="mono">{{ patient.mrn }}</span> ·
+      {{ patient.age }} years · {{ patient.sex.value }} ·
+      registered {{ patient.created_at | date }}
+    </p>
+  </div>
+  <div class="actions">
+    <a class="btn primary" href="/appointments/new?patient_id={{ patient.id }}">Book appointment</a>
+    <a class="btn" href="/consultations/new?patient_id={{ patient.id }}">Record visit</a>
+    <a class="btn ghost" href="/patients/{{ patient.id }}/edit">Edit</a>
+  </div>
+</div>
+
+{% if patient.allergies %}
+<p class="alert warn"><strong>Allergies:</strong> {{ patient.allergies }}</p>
+{% endif %}
+
+<div class="two-col">
+  <section class="card">
+    <h2>Details</h2>
+    <dl class="kv">
+      <dt>Date of birth</dt><dd>{{ patient.date_of_birth | date }}</dd>
+      <dt>Phone</dt><dd>{{ patient.phone }}</dd>
+      <dt>Blood group</dt><dd>{{ patient.blood_group or '—' }}</dd>
+      <dt>Address</dt><dd>{{ patient.address or '—' }}</dd>
+      <dt>Allergies</dt><dd>{{ patient.allergies or 'None recorded' }}</dd>
+    </dl>
+  </section>
+
+  <section class="card">
+    <h2>Appointments</h2>
+    {% if patient.appointments %}
+    <ul class="list">
+      {% for a in patient.appointments %}
+      <li>
+        <span class="when">{{ a.scheduled_at | datetime('%d %b %Y, %H:%M') }}</span>
+        {{ a.doctor.full_name }}
+        <span class="pill s-{{ a.status.name }}">{{ a.status.value }}</span>
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p class="empty">No appointments booked.</p>
+    {% endif %}
+  </section>
+</div>
+
+<section class="card">
+  <h2>Medical history</h2>
+  {% if patient.consultations %}
+    {% for c in patient.consultations %}
+    <article class="record">
+      <header>
+        <strong>{{ c.visited_at | date }}</strong>
+        <span class="muted">{{ c.doctor.full_name }} · {{ c.doctor.specialisation }}</span>
+        <a class="btn small ghost" href="/consultations/{{ c.id }}">Open</a>
+      </header>
+      <dl class="kv tight">
+        {% if c.symptoms %}<dt>Symptoms</dt><dd>{{ c.symptoms }}</dd>{% endif %}
+        <dt>Diagnosis</dt><dd>{{ c.diagnosis }}</dd>
+        {% if c.prescription %}<dt>Prescription</dt><dd>{{ c.prescription | nl2br }}</dd>{% endif %}
+        {% if c.follow_up_on %}<dt>Follow-up</dt><dd>{{ c.follow_up_on | date }}</dd>{% endif %}
+      </dl>
+    </article>
+    {% endfor %}
+  {% else %}
+  <p class="empty">No consultations recorded for this patient.</p>
+  {% endif %}
+</section>
+{% endblock %}

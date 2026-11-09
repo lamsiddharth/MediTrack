@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% set nav = 'consultations' %}
+{% block title %}Consultation record{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Consultation record</h1>
+    <p class="muted">
+      <a href="/patients/{{ consultation.patient.id }}">{{ consultation.patient.full_name }}</a>
+      <span class="mono">({{ consultation.patient.mrn }})</span> ·
+      {{ consultation.visited_at | datetime }} ·
+      {{ consultation.doctor.full_name }}, {{ consultation.doctor.specialisation }}
+    </p>
+  </div>
+</div>
+
+{% if consultation.patient.allergies %}
+<p class="alert warn"><strong>Allergies:</strong> {{ consultation.patient.allergies }}</p>
+{% endif %}
+
+<div class="two-col">
+  <section class="card">
+    <h2>Clinical</h2>
+    <dl class="kv">
+      <dt>Symptoms</dt><dd>{{ consultation.symptoms | nl2br }}</dd>
+      <dt>Diagnosis</dt><dd>{{ consultation.diagnosis | nl2br }}</dd>
+      <dt>Prescription</dt><dd>{{ consultation.prescription | nl2br }}</dd>
+      <dt>Notes</dt><dd>{{ consultation.notes | nl2br }}</dd>
+      <dt>Follow-up</dt><dd>{{ consultation.follow_up_on | date }}</dd>
+    </dl>
+  </section>
+
+  <section class="card">
+    <h2>Billing</h2>
+    <dl class="kv">
+      <dt>Fee</dt><dd class="amount">{{ consultation.fee | money }}</dd>
+      <dt>Status</dt>
+      <dd><span class="pill p-{{ consultation.payment_status.name }}">{{ consultation.payment_status.value }}</span></dd>
+    </dl>
+
+    <form method="post" action="/consultations/{{ consultation.id }}/payment">
+      <label for="payment_status">Update payment</label>
+      <select id="payment_status" name="payment_status">
+        {% for s in payment_statuses %}
+        <option value="{{ s.value }}" {{ 'selected' if consultation.payment_status == s }}>{{ s.value }}</option>
+        {% endfor %}
+      </select>
+      <div class="form-actions">
+        <button type="submit" class="primary">Save</button>
+      </div>
+    </form>
+  </section>
+</div>
+{% endblock %}

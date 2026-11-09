@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% set nav = 'appointments' %}
+{% block title %}Book appointment{% endblock %}
+
+{% block content %}
+<div class="page-head"><div><h1>Book appointment</h1></div></div>
+
+{% if error %}<p class="alert error">{{ error }}</p>{% endif %}
+
+<section class="card">
+  <form method="post" action="/appointments/new">
+    <div class="grid2">
+      <div>
+        <label for="patient_id">Patient</label>
+        <select id="patient_id" name="patient_id" required>
+          <option value="">Select a patient…</option>
+          {% for p in patients %}
+          <option value="{{ p.id }}"
+            {{ 'selected' if (form.patient_id or preset_patient_id) | string == p.id | string }}>
+            {{ p.full_name }} ({{ p.mrn }})
+          </option>
+          {% endfor %}
+        </select>
+      </div>
+      <div>
+        <label for="doctor_id">Doctor</label>
+        <select id="doctor_id" name="doctor_id" required>
+          <option value="">Select a doctor…</option>
+          {% for d in doctors %}
+          <option value="{{ d.id }}" {{ 'selected' if form.doctor_id | string == d.id | string }}>
+            {{ d.full_name }} — {{ d.specialisation }}
+          </option>
+          {% endfor %}
+        </select>
+      </div>
+      <div>
+        <label for="scheduled_at">Date and time</label>
+        <input id="scheduled_at" name="scheduled_at" type="datetime-local"
+               value="{{ form.scheduled_at or '' }}" required>
+      </div>
+      <div>
+        <label for="reason">Reason</label>
+        <input id="reason" name="reason" value="{{ form.reason or '' }}"
+               placeholder="e.g. Persistent cough">
+      </div>
+    </div>
+    <div class="form-actions">
+      <button type="submit" class="primary">Book appointment</button>
+      <a class="btn ghost" href="/appointments">Cancel</a>
+    </div>
+  </form>
+</section>
+
+{% if not patients or not doctors %}
+<p class="alert warn">
+  {% if not patients %}You need at least one <a href="/patients/new">registered patient</a>.{% endif %}
+  {% if not doctors %}You need at least one <a href="/doctors/new">doctor on the roster</a>.{% endif %}
+</p>
+{% endif %}
+{% endblock %}

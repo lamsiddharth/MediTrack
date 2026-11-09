@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% set nav = 'doctors' %}
+{% block title %}{{ 'Edit doctor' if doctor else 'Add doctor' }}{% endblock %}
+
+{% block content %}
+<div class="page-head"><div><h1>{{ 'Edit doctor' if doctor else 'Add doctor' }}</h1></div></div>
+
+{% if error %}<p class="alert error">{{ error }}</p>{% endif %}
+
+<section class="card">
+  <form method="post" action="{{ '/doctors/%d/edit' % doctor.id if doctor else '/doctors/new' }}">
+    <div class="grid2">
+      <div>
+        <label for="full_name">Full name</label>
+        <input id="full_name" name="full_name" value="{{ doctor.full_name if doctor else '' }}" required>
+      </div>
+      <div>
+        <label for="specialisation">Specialisation</label>
+        <input id="specialisation" name="specialisation" value="{{ doctor.specialisation if doctor else '' }}" required>
+      </div>
+      <div>
+        <label for="room">Room</label>
+        <input id="room" name="room" value="{{ doctor.room or '' if doctor else '' }}">
+      </div>
+      <div>
+        <label for="phone">Phone</label>
+        <input id="phone" name="phone" value="{{ doctor.phone or '' if doctor else '' }}">
+      </div>
+      <div>
+        <label for="consultation_fee">Consultation fee</label>
+        <input id="consultation_fee" name="consultation_fee" type="number" min="0" step="1"
+               value="{{ doctor.consultation_fee | round | int if doctor else 0 }}">
+      </div>
+    </div>
+    <div class="form-actions">
+      <button type="submit" class="primary">{{ 'Save changes' if doctor else 'Add doctor' }}</button>
+      <a class="btn ghost" href="/doctors">Cancel</a>
+    </div>
+  </form>
+</section>
+{% endblock %}

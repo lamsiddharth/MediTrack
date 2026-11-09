@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% set nav = 'patients' %}
+{% block title %}{{ 'Edit patient' if patient else 'Register patient' }}{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>{{ 'Edit patient' if patient else 'Register patient' }}</h1>
+    {% if patient %}<p class="muted mono">{{ patient.mrn }}</p>{% endif %}
+  </div>
+</div>
+
+{% if error %}<p class="alert error">{{ error }}</p>{% endif %}
+
+<section class="card">
+  <form method="post" action="{{ '/patients/%d/edit' % patient.id if patient else '/patients/new' }}">
+    <div class="grid2">
+      <div>
+        <label for="full_name">Full name</label>
+        <input id="full_name" name="full_name" value="{{ patient.full_name if patient else '' }}" required>
+      </div>
+      <div>
+        <label for="phone">Phone</label>
+        <input id="phone" name="phone" value="{{ patient.phone if patient else '' }}" required>
+      </div>
+      <div>
+        <label for="date_of_birth">Date of birth</label>
+        <input id="date_of_birth" name="date_of_birth" type="date"
+               value="{{ patient.date_of_birth.isoformat() if patient else '' }}" required>
+      </div>
+      <div>
+        <label for="sex">Sex</label>
+        <select id="sex" name="sex">
+          {% for s in sexes %}
+          <option value="{{ s.value }}" {{ 'selected' if patient and patient.sex == s }}>{{ s.value }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div>
+        <label for="blood_group">Blood group</label>
+        <input id="blood_group" name="blood_group" value="{{ patient.blood_group or '' if patient else '' }}"
+               placeholder="e.g. O+">
+      </div>
+      <div>
+        <label for="address">Address</label>
+        <input id="address" name="address" value="{{ patient.address or '' if patient else '' }}">
+      </div>
+    </div>
+
+    <label for="allergies">Known allergies</label>
+    <textarea id="allergies" name="allergies" rows="2"
+              placeholder="Leave blank if none">{{ patient.allergies or '' if patient else '' }}</textarea>
+
+    <div class="form-actions">
+      <button type="submit" class="primary">{{ 'Save changes' if patient else 'Register patient' }}</button>
+      <a class="btn ghost" href="{{ '/patients/%d' % patient.id if patient else '/patients' }}">Cancel</a>
+    </div>
+  </form>
+</section>
+{% endblock %}

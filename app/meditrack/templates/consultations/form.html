@@ -1,0 +1,89 @@
+{% extends "base.html" %}
+{% set nav = 'consultations' %}
+{% block title %}Record visit{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Record visit</h1>
+    {% if appointment %}
+    <p class="muted">
+      From appointment: {{ appointment.patient.full_name }} with
+      {{ appointment.doctor.full_name }} at {{ appointment.scheduled_at | datetime }}
+    </p>
+    {% endif %}
+  </div>
+</div>
+
+{% if error %}<p class="alert error">{{ error }}</p>{% endif %}
+
+<section class="card">
+  <form method="post" action="/consultations/new">
+    {% if appointment %}<input type="hidden" name="appointment_id" value="{{ appointment.id }}">{% endif %}
+
+    <div class="grid2">
+      <div>
+        <label for="patient_id">Patient</label>
+        <select id="patient_id" name="patient_id" required>
+          <option value="">Select a patient…</option>
+          {% for p in patients %}
+          <option value="{{ p.id }}" {{ 'selected' if preset_patient_id | string == p.id | string }}>
+            {{ p.full_name }} ({{ p.mrn }})
+          </option>
+          {% endfor %}
+        </select>
+      </div>
+      <div>
+        <label for="doctor_id">Doctor</label>
+        <select id="doctor_id" name="doctor_id" required>
+          <option value="">Select a doctor…</option>
+          {% for d in doctors %}
+          <option value="{{ d.id }}" {{ 'selected' if preset_doctor_id | string == d.id | string }}>
+            {{ d.full_name }} — {{ d.specialisation }}
+          </option>
+          {% endfor %}
+        </select>
+      </div>
+    </div>
+
+    <label for="symptoms">Symptoms</label>
+    <textarea id="symptoms" name="symptoms" rows="2"
+              placeholder="What the patient reported">{{ form.symptoms or '' }}</textarea>
+
+    <label for="diagnosis">Diagnosis <span class="req">required</span></label>
+    <textarea id="diagnosis" name="diagnosis" rows="2" required>{{ form.diagnosis or '' }}</textarea>
+
+    <label for="prescription">Prescription</label>
+    <textarea id="prescription" name="prescription" rows="3"
+              placeholder="One medication per line">{{ form.prescription or '' }}</textarea>
+
+    <label for="notes">Notes</label>
+    <textarea id="notes" name="notes" rows="2">{{ form.notes or '' }}</textarea>
+
+    <div class="grid2">
+      <div>
+        <label for="follow_up_on">Follow-up date</label>
+        <input id="follow_up_on" name="follow_up_on" type="date" value="{{ form.follow_up_on or '' }}">
+      </div>
+      <div>
+        <label for="fee">Fee</label>
+        <input id="fee" name="fee" type="number" min="0" step="1"
+               value="{{ form.fee or (preset_fee | round | int if preset_fee is not none else 0) }}">
+      </div>
+      <div>
+        <label for="payment_status">Payment</label>
+        <select id="payment_status" name="payment_status">
+          {% for s in payment_statuses %}
+          <option value="{{ s.value }}" {{ 'selected' if form.payment_status == s.value }}>{{ s.value }}</option>
+          {% endfor %}
+        </select>
+      </div>
+    </div>
+
+    <div class="form-actions">
+      <button type="submit" class="primary">Save record</button>
+      <a class="btn ghost" href="/consultations">Cancel</a>
+    </div>
+  </form>
+</section>
+{% endblock %}

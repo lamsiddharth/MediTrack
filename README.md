@@ -1,0 +1,265 @@
+# MediTrack — Hospital Management System
+
+A small hospital management system, deployed to an AWS EC2 instance using
+Docker. Written for this project rather than vendored from elsewhere.
+
+| | |
+|---|---|
+| **Application** | MediTrack — Python / FastAPI, server-rendered HTML, SQLite |
+| **Image delivery** | Source sent to the instance over SSH and built there. No registry, no local Docker. |
+| **Cloud** | AWS EC2 — `t3.micro`, Amazon Linux 2023 |
+| **Sign in** | `admin` / `admin123` — change it immediately after first login |
+
+> **Synthetic data only.** This system is shaped like one that would hold patient
+> records, and it is deployed over plain HTTP on a public address with a known
+> default password. That is acceptable for a demonstration with invented data
+> and not acceptable for anything else. Before putting real patient information
+> in it, put TLS in front, restrict who can reach it, and change the password.
+> In India the DPDP Act applies to personal health data.
+
+---
+
+## What it does
+
+The workflow of a small clinic, end to end:
+
+- **Patients** — register with an auto-allocated medical record number (`MRN-00001`),
+  search by name, MRN or phone, and view a full history on one page. Age is
+  computed from date of birth. Known allergies are shown as a banner on the
+  patient record and on every consultation, because that is the one detail you
+  do not want buried in a field.
+- **Doctors** — roster with specialisation, room, and a per-doctor consultation
+  fee that pre-fills the billing on a visit.
+- **Appointments** — book a patient with a doctor, browse any day, filter by
+  status, and mark a booking as cancelled or a no-show. **Double-booking is
+  refused**: slots are 20 minutes, and a clash reports who already holds the
+  slot. Cancellations and no-shows release it.
+- **Consultations** — the clinical record: symptoms, diagnosis, prescription,
+  notes, follow-up date. Recording a visit against a booking marks that booking
+  completed automatically. A walk-in can be recorded with no prior booking.
+- **Billing** — a fee and payment status per consultation, an "unpaid only"
+  filter, and total outstanding on the dashboard.
+- **Dashboard** — patient and doctor counts, today's schedule, who is still to
+  be seen, what is coming up, recent records, and money outstanding.
+
+Authentication is deliberately plain: one account, username and password, a
+signed session cookie. No roles, no tokens, no password reset. The one thing
+not simplified away is that the password is **hashed with bcrypt** rather than
+stored in the clear.
+
+## Demo data
+
+On an empty database the app seeds itself: 5 doctors across different
+specialisations, 10 patients spanning ages 8 to 78 with varied blood groups and
+allergies, 13 appointments positioned relative to today (some already completed,
+one no-show, one cancelled, several upcoming), and 4 written-up consultations
+with realistic diagnoses and prescriptions — one left unpaid so the outstanding
+total is non-zero.
+
+Seeding only runs when the patient table is empty, so restarting never
+duplicates records or resurrects ones you deleted. Set `SEED_DEMO_DATA=false`
+to start genuinely empty.
+
+---
+
+## Repository contents
+
+| Path | Purpose |
+|---|---|
+| `app/meditrack/` | The application. `models.py`, `routes/`, `templates/`, `seed.py`. |
+| `app/Dockerfile` | Single-stage Python image. No frontend toolchain. |
+| `app/tests/` | 33 tests covering the login gate, every page, and the booking and validation rules. |
+| `bootstrap.sh` | Instance user-data. Swap and Docker. Pass it verbatim; needs no credentials. |
+| `deploy.sh` | Sends `app/` to the instance, builds the image there, starts the container, verifies health. |
+
+---
+
+## Running it locally
+
+```bash
+cd app
+uv venv && uv pip install -e '.[dev]'
+uv run uvicorn meditrack.main:app --reload --port 8000
+```
+
+Open <http://127.0.0.1:8000> and sign in with `admin` / `admin123`.
+The database is created at `app/data/meditrack.db`.
+
+```bash
+uv run pytest            # 33 tests
+```
+
+## Configuration
+
+Every setting is an environment variable with a sensible default.
+
+| Variable | Default | Notes |
+|---|---|---|
+| `APP_NAME` | `MediTrack` | Shown in the UI |
+| `DATA_DIR` | `./data` | Where the SQLite file lives; `/data` in the container |
+| `DATABASE_URL` | SQLite in `DATA_DIR` | Point at PostgreSQL if you outgrow SQLite |
+| `SECRET_KEY` | generated per process | **Set this.** Unset means sessions die on restart |
+| `SESSION_MAX_AGE` | `28800` (8h) | Session lifetime in seconds |
+| `SEED_USERNAME` | `admin` | The one account |
+| `SEED_PASSWORD` | `admin123` | Only used when first creating the account |
+| `SEED_FULL_NAME` | `Dr. A. Menon` | Display name |
+| `SEED_DEMO_DATA` | `true` | `false` to skip the demo records |
+
+`deploy.sh` generates a `SECRET_KEY` once into `.secret-key` and reuses it, so
+redeploying does not sign you out. That file is gitignored — keep it.
+
+---
+
+## Deploying
+
+### Prerequisites
+
+- AWS CLI v2, configured: `aws configure --profile <name>`
+- `bash`, `curl`, `tar`, `ssh`. No Docker needed locally.
+
+```bash
+export AWS_PROFILE=<name> AWS_DEFAULT_REGION=ap-southeast-2
+```
+
+> **Turn off Cloudflare WARP (or any VPN) before deploying.** It intercepts
+> outbound SSH, and it also makes `checkip` report a rotating Cloudflare address,
+> which would put the wrong IP in your port-22 rule. `deploy.sh` checks for this
+> and says so. Verify with:
+> `curl -s https://www.cloudflare.com/cdn-cgi/trace | grep warp=`
+
+### 1. Allocate the Elastic IP first
+
+```bash
+ALLOC=$(aws ec2 allocate-address --domain vpc --query AllocationId --output text)
+IP=$(aws ec2 describe-addresses --allocation-ids "$ALLOC" \
+      --query 'Addresses[0].PublicIp' --output text)
+echo "$IP" > .static-ip
+echo "$IP"
+```
+
+### 2. Key pair and security group
+
+```bash
+aws ec2 create-key-pair --key-name meditrack-key \
+  --query KeyMaterial --output text > ~/.ssh/meditrack-key.pem
+chmod 600 ~/.ssh/meditrack-key.pem
+
+MYIP=$(curl -fsS https://checkip.amazonaws.com)
+SG=$(aws ec2 create-security-group --group-name meditrack-sg \
+      --description "MediTrack web + admin SSH" --query GroupId --output text)
+
+aws ec2 authorize-security-group-ingress --group-id "$SG" \
+  --protocol tcp --port 80 --cidr 0.0.0.0/0
+aws ec2 authorize-security-group-ingress --group-id "$SG" \
+  --protocol tcp --port 22 --cidr "${MYIP}/32"
+```
+
+> Write the key to `~/.ssh/`, not into this directory. On WSL, Windows drive
+> mounts under `/mnt/c` cannot represent Unix permission bits, so the file stays
+> world-readable and SSH refuses to use it.
+
+### 3. Launch
+
+```bash
+AMI=$(aws ssm get-parameter \
+  --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 \
+  --query 'Parameter.Value' --output text)
+
+INSTANCE=$(aws ec2 run-instances \
+  --image-id "$AMI" \
+  --instance-type t3.micro \
+  --key-name meditrack-key \
+  --security-group-ids "$SG" \
+  --block-device-mappings 'DeviceName=/dev/xvda,Ebs={VolumeSize=12,VolumeType=gp3}' \
+  --user-data "file://bootstrap.sh" \
+  --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=meditrack}]' \
+  --query 'Instances[0].InstanceId' --output text)
+
+aws ec2 wait instance-running --instance-ids "$INSTANCE"
+aws ec2 associate-address --instance-id "$INSTANCE" --allocation-id "$ALLOC"
+```
+
+No `--iam-instance-profile`: the instance needs no AWS permissions.
+
+Wait for the bootstrap to install Docker:
+
+```bash
+ssh -i ~/.ssh/meditrack-key.pem ec2-user@"$IP" \
+  'while [ ! -f /opt/bootstrap-done ]; do sleep 5; done; echo ready'
+```
+
+### 4. Deploy
+
+```bash
+PUBLIC_IP="$IP" ./deploy.sh
+```
+
+The transfer is under a megabyte and the build takes a minute or two — there is
+no frontend toolchain and no separate database server, which is why this fits a
+`t3.micro` comfortably. `deploy.sh` polls `/healthz` and exits non-zero if the
+app does not come up.
+
+### 5. Sign in and change the password
+
+Open `http://$IP`, sign in with `admin` / `admin123`, then go to **Account** and
+change it. The instance is publicly reachable on port 80.
+
+---
+
+## Operating it
+
+```bash
+IP="$(cat .static-ip)"
+ssh -i ~/.ssh/meditrack-key.pem ec2-user@"$IP"
+
+docker ps
+docker logs -f meditrack
+docker stats --no-stream
+```
+
+Back up the database:
+
+```bash
+IP="$(cat .static-ip)"
+ssh -i ~/.ssh/meditrack-key.pem ec2-user@"$IP" \
+  'docker run --rm -v meditrack-data:/d -v /tmp:/b alpine \
+     tar czf /b/meditrack-backup.tar.gz -C /d .'
+scp -i ~/.ssh/meditrack-key.pem ec2-user@"$IP":/tmp/meditrack-backup.tar.gz .
+```
+
+## Updating after a change
+
+```bash
+./deploy.sh
+```
+
+Rebuilds and replaces the container. The `meditrack-data` volume is untouched,
+so the database survives. The two most recent images are kept, so you can roll
+back by name without rebuilding.
+
+## Tearing down
+
+```bash
+aws ec2 terminate-instances --instance-ids "$INSTANCE"
+aws ec2 wait instance-terminated --instance-ids "$INSTANCE"
+aws ec2 release-address --allocation-id "$ALLOC"
+aws ec2 delete-key-pair --key-name meditrack-key
+aws ec2 delete-security-group --group-id "$SG"
+```
+
+Release the Elastic IP: an allocated address not associated with a running
+instance is billed.
+
+## Known limitations
+
+Deliberate, given the scope:
+
+- **No TLS.** Traffic is plain HTTP. The first thing to fix for any real use.
+- **One instance, one Availability Zone.** No redundancy; losing it loses the service.
+- **SQLite on instance-local storage.** Fine for a single clinic's write volume;
+  the data lives in a Docker volume on one EBS disk.
+- **No automated backups.** The command above is manual.
+- **One account, no roles.** A real system would separate reception, clinicians
+  and administrators, and would keep an audit trail of who read which record.
+- **No monitoring or alerting.** `/healthz` exists and Docker restarts the
+  container, but nothing tells you if it is down.

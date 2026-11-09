@@ -1,0 +1,104 @@
+{% extends "base.html" %}
+{% set nav = 'dashboard' %}
+{% block title %}Dashboard{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Dashboard</h1>
+    <p class="muted">{{ today | date('%A, %d %B %Y') }}</p>
+  </div>
+  <div class="actions">
+    <a class="btn primary" href="/appointments/new">Book appointment</a>
+    <a class="btn" href="/patients/new">Register patient</a>
+  </div>
+</div>
+
+<div class="stats">
+  <a class="stat" href="/patients">
+    <span class="n">{{ stats.patients }}</span><span class="l">Patients</span>
+  </a>
+  <a class="stat" href="/appointments">
+    <span class="n">{{ stats.today_total }}</span><span class="l">Today's appointments</span>
+  </a>
+  <a class="stat" href="/appointments?status=Scheduled">
+    <span class="n">{{ stats.today_waiting }}</span><span class="l">Still to be seen</span>
+  </a>
+  <a class="stat" href="/consultations">
+    <span class="n">{{ stats.consultations }}</span><span class="l">Records</span>
+  </a>
+  <a class="stat" href="/doctors">
+    <span class="n">{{ stats.doctors }}</span><span class="l">Doctors</span>
+  </a>
+  <a class="stat {{ 'warn' if stats.outstanding }}" href="/consultations?unpaid=1">
+    <span class="n">{{ stats.outstanding | money }}</span><span class="l">Outstanding</span>
+  </a>
+</div>
+
+<section class="card">
+  <h2>Today's schedule</h2>
+  {% if todays %}
+  <table>
+    <thead>
+      <tr><th>Time</th><th>Patient</th><th>Doctor</th><th>Reason</th><th>Status</th><th></th></tr>
+    </thead>
+    <tbody>
+      {% for a in todays %}
+      <tr>
+        <td class="nowrap">{{ a.scheduled_at | time }}</td>
+        <td><a href="/patients/{{ a.patient.id }}">{{ a.patient.full_name }}</a></td>
+        <td>{{ a.doctor.full_name }}<br><span class="muted small">{{ a.doctor.specialisation }}</span></td>
+        <td>{{ a.reason or '—' }}</td>
+        <td><span class="pill s-{{ a.status.name }}">{{ a.status.value }}</span></td>
+        <td class="right">
+          {% if a.status.name == 'scheduled' %}
+            <a class="btn small" href="/consultations/new?appointment_id={{ a.id }}">Record visit</a>
+          {% elif a.consultation %}
+            <a class="btn small" href="/consultations/{{ a.consultation.id }}">View record</a>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty">Nothing booked for today.</p>
+  {% endif %}
+</section>
+
+<div class="two-col">
+  <section class="card">
+    <h2>Coming up</h2>
+    {% if upcoming %}
+    <ul class="list">
+      {% for a in upcoming %}
+      <li>
+        <span class="when">{{ a.scheduled_at | datetime('%d %b, %H:%M') }}</span>
+        <a href="/patients/{{ a.patient.id }}">{{ a.patient.full_name }}</a>
+        <span class="muted small">with {{ a.doctor.full_name }}</span>
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p class="empty">No future appointments booked.</p>
+    {% endif %}
+  </section>
+
+  <section class="card">
+    <h2>Recent records</h2>
+    {% if recent %}
+    <ul class="list">
+      {% for c in recent %}
+      <li>
+        <span class="when">{{ c.visited_at | date('%d %b') }}</span>
+        <a href="/consultations/{{ c.id }}">{{ c.patient.full_name }}</a>
+        <span class="muted small">{{ c.diagnosis | truncate(44) }}</span>
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p class="empty">No consultations recorded yet.</p>
+    {% endif %}
+  </section>
+</div>
+{% endblock %}
