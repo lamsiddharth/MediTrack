@@ -18,11 +18,12 @@
 > because the infrastructure only makes sense once the workload is clear. **§4
 > and §5 are the substance of the project**: the three-tier architecture, how
 > the tiers reach one another, and why each cloud service was chosen. §6 covers
-> implementation, §7 results, §8 conclusions.
+> implementation and §7 the conclusions.
 >
-> Cost and availability figures in §7.4 and §7.5 are analysis derived from the
-> topology and published rates, not measurements; §7.2 says which is which. No
-> latency, throughput or availability figure is presented as observed.
+> The availability and cost figures in §4.8 and §4.9 are analysis derived from
+> the topology and from published on-demand rates. They are not measurements,
+> and no latency, throughput or availability figure in this report is presented
+> as observed.
 ---
 
 ## 1. Problem statement
@@ -77,7 +78,7 @@ The deployment problem has a particular shape because the data is clinical:
 | **O6** | Lay out the network so a move to multi-AZ requires no re-addressing | §4.5 — subnets in two AZs from the outset |
 | **O7** | Enforce least privilege between tiers and towards AWS services | §4.4, §5.5 — security-group chaining; scoped IAM policy |
 | **O8** | Keep the design reproducible rather than hand-built | §6.3 — provisioning as scripts under `infra/` |
-| **O9** | Be explicit about what this design does *not* provide | §7.4, §8.2 — single-AZ, no TLS, no failover |
+| **O9** | Be explicit about what this design does *not* provide | §4.8, §7.2 — single-AZ, no TLS, no failover |
 
 ### 2.1 Out of scope
 
@@ -87,8 +88,8 @@ Stated deliberately, because a reader should not assume these were overlooked:
   by the presentation tier's Elastic IP address. §4.6 explains how the tiers
   address each other without it.
 - **Automatic failover.** Subnets exist in two zones; compute and the database
-  run in one. §7.4 quantifies the exposure.
-- **TLS.** Traffic is plain HTTP. §8.2 treats this as the first thing to fix and
+  run in one. §4.8 quantifies the exposure.
+- **TLS.** Traffic is plain HTTP. §7.2 treats this as the first thing to fix and
   explains why it was not done here.
 - **Horizontal scaling and load balancing.** One instance per tier.
 
@@ -204,7 +205,7 @@ On an empty database the system seeds itself a working clinic — 5 doctors, 10
 patients aged 8 to 78 with varied blood groups and allergies, 13 appointments
 positioned relative to today including completed, cancelled and no-show, and 4
 written-up consultations with one left unpaid so the outstanding total is not
-zero. §8.2 lists what a real deployment would need beyond this.
+zero. §7.2 lists what a real deployment would need beyond this.
 
 ---
 
@@ -553,6 +554,47 @@ The bucket stays private throughout — the URL is signed, time-limited, and
 grants access to one object. A clinical document therefore never traverses the
 application instance or the proxy, which matters when both are `t3.micro`.
 
+### 4.8 Availability assessment
+
+With compute and database in `ap-southeast-2a` only:
+
+| Failure | Consequence | Recovery |
+|---|---|---|
+| Application instance fails | Total outage | Manual relaunch and redeploy |
+| Presentation instance fails | Total outage | Manual relaunch |
+| RDS instance fails | Total outage, data intact | Restore from automated backup |
+| **AZ `ap-southeast-2a` fails** | **Total outage** | **Manual rebuild in `2b`** |
+| NAT Gateway fails | Service continues; S3 unaffected (gateway endpoint); OS updates and image builds fail | Recreate |
+| S3 unavailable | Note bodies unreadable, rendered as unavailable in place; rest of application works | Wait |
+
+The last row is the only graceful degradation in the system, and it exists
+because it was deliberately built and tested. Everything above it is a hard
+outage. That is the honest cost of a single-AZ deployment, and §7.2 gives the
+remediation.
+
+### 4.9 Indicative monthly cost
+
+`ap-southeast-2`, on-demand, excluding free-tier credits. Approximate.
+
+| Item | ~USD/month |
+|---|---|
+| EC2 `t3.micro` × 2 (presentation, application) | 19 |
+| RDS `db.t4g.micro`, 20 GB gp3, single-AZ | 17 |
+| **NAT Gateway** (hourly + data processing) | **35** |
+| Elastic IPs × 2 (one attached, one on the NAT) | 4 |
+| ECR storage (two repositories, 10 images retained) | 1 |
+| S3 storage and requests (low volume) | <1 |
+| EBS root volumes | 3 |
+| **Total** | **≈ 79** |
+
+The NAT Gateway is the largest single line — more than both compute tiers
+together. The S3 Gateway Endpoint is therefore not merely a
+networking nicety: it removes per-gigabyte NAT processing charges on the largest
+objects the system handles. The alternatives for reducing it further — a NAT
+*instance* on a `t3.nano`, or putting the application tier in the public subnet
+with no inbound rules — trade either self-managed NAT or the isolation property
+of §4.3, which is the substance of the design.
+
 ---
 
 ## 5. Cloud services used
@@ -779,7 +821,7 @@ Shell scripts against the AWS CLI were chosen over CloudFormation or Terraform
 deliberately. At this size the declarative tools' advantages — drift detection
 and dependency graphs — buy little, while the scripts keep every API call
 visible, which was the point of the exercise. For anything larger the trade
-reverses, and §8.2 says so.
+reverses, and §7.2 says so.
 
 ### 6.5 Container images
 
@@ -886,188 +928,9 @@ An ECR lifecycle policy keeps the ten most recent images per repository and
 expires the rest, so the registry does not accumulate every build ever made
 while still retaining enough history for a rollback.
 
-## 7. Results
+## 7. Conclusion
 
-### 7.1 Application verification
-
-**Backend test suite — 73 tests, all passing.**
-
-```
-$ cd app && uv run pytest -q
-........................................................................
-73 passed in 44.92s
-```
-
-Coverage is behavioural rather than incidental:
-
-| Area | Tests verify |
-|---|---|
-| Authentication | every protected endpoint returns 401 unauthenticated; wrong password rejected; unknown user and wrong password are indistinguishable; login/`me`/logout cycle |
-| Metadata | `/meta` exposes the enumerations and limits the client renders from |
-| Patients | registration allocates sequential MRNs; future and malformed dates of birth rejected; unknown sex rejected; search matches name, MRN and phone |
-| Appointments | booking succeeds; same doctor in the same slot refused with 409; a 10-minute offset still refused as overlapping; a different doctor at the same time allowed; 25 minutes later allowed; **cancelling releases the slot** |
-| Consultations | blank diagnosis rejected; negative fee rejected; recording a visit completes its appointment; one consultation per appointment enforced; walk-ins need no booking |
-| Storage | local and S3 drivers round-trip; presigned URLs use the regional host; traversal in object keys and filenames neutralised; oversized and disallowed attachment types rejected; an attachment cannot be fetched through a different consultation |
-| Failure handling | a storage outage mid-write records no database row; a note whose object has vanished is reported `unavailable` rather than failing the response |
-
-**Frontend — type-checked and built.** `tsc --noEmit` passes with
-`strict`, `noUnusedLocals` and `noUnusedParameters` enabled. `vite build`
-produces 267 kB of JavaScript (82 kB gzipped) in 1.66 s.
-
-**Both tiers verified together across the proxy boundary.** The API and the
-presentation tier were run as separate processes with `/api` forwarded by
-path — the same forwarding nginx performs in the architecture of §4.2 — and
-driven end to end:
-
-```
-GET  /                      200    SPA shell
-GET  /patients              200    client-side route, shell served
-GET  /api/auth/me           401    {"detail":"Not signed in"}
-POST /api/auth/login        200    session cookie set
-GET  /api/auth/me           200    ...and accepted on the next request
-GET  /api/dashboard         200
-GET  /api/consultations/1   200
-```
-
-The session cookie surviving the proxy hop is the specific property under
-test: it is what makes same-origin cookie authentication viable instead of a
-bearer token in browser storage.
-
-**The double-booking rule, across the full request path:**
-
-```
-POST /api/appointments  09:00  doctor 1  -> 201
-POST /api/appointments  09:10  doctor 1  -> 409
-  "That doctor already has Arjun Sharma booked at 09:00 on 20 Dec 2026.
-   Slots are 20 minutes long — pick another time."
-POST /api/appointments  09:00  doctor 2  -> 201
-```
-
-**Object storage verified against the live S3 service.** Not mocked:
-
-```
-PUT/GET note body          : OK
-presigned host             : <bucket>.s3.ap-southeast-2.amazonaws.com
-fetch via presigned URL    : OK
-content-disposition        : attachment; filename="Lab_Report.pdf"
-```
-
-A note with a PDF attachment submitted through the running application wrote
-both objects to the bucket under the layout of §5.4, the body was read back
-and rendered, and the attachment downloaded through a presigned URL matched
-the upload byte for byte.
-
-**Bucket configuration — confirmed by inspection:**
-
-```
-public access block : BlockPublicAcls, IgnorePublicAcls,
-                      BlockPublicPolicy, RestrictPublicBuckets  = all true
-encryption          : AES256
-versioning          : Enabled
-region              : ap-southeast-2
-```
-
-**Database portability — verified without an instance.** A PostgreSQL
-`DATABASE_URL` produces a correctly configured engine (`psycopg` driver,
-`QueuePool` of 5, pre-ping enabled) without contacting a server, confirming the
-application is ready for the data tier of §4.4 with only a configuration
-change.
-
-### 7.2 What is measured and what is estimated
-
-The figures in §7.1 are measurements taken from the application and from the
-live S3 service. The figures in §7.4 and §7.5 are **analysis, not
-measurement**: the availability table reasons about failure modes from the
-topology, and the cost table is computed from published on-demand rates. No
-latency, throughput or availability number is presented as observed, because
-measuring those would require sustained load against provisioned
-infrastructure.
-
-### 7.3 Problems encountered
-
-Three defects were found by testing the S3 feature, each of which would have
-reached users:
-
-1. **Empty file input returned HTTP 422.** Declaring the upload as a typed
-   `UploadFile` parameter made FastAPI reject every note saved without choosing
-   a file, because browsers always submit a file input — as a part with an empty
-   filename. Fixed by reading the form directly.
-2. **The fix then silently discarded all attachments.** `request.form()` yields
-   `starlette.datastructures.UploadFile`, and `fastapi.UploadFile` is a
-   *subclass* of it, so an `isinstance` check against the latter never matched.
-   Notes saved successfully with the attachment dropped — the worst failure
-   mode, because nothing reported an error.
-3. **Presigned URLs returned 403.** boto3 signed them against the global
-   `s3.amazonaws.com` endpoint. For a bucket outside `us-east-1` that endpoint
-   answers with a 307 redirect to the regional host, and because SigV4 signs the
-   `Host` header, following the redirect invalidates the signature. Fixed with
-   `addressing_style: "virtual"`.
-
-Converting the server-rendered interface into a React client and a JSON API
-surfaced two more:
-
-4. **`model_validate(obj, update={...})` is not valid Pydantic v2.** `update` is
-   a parameter of `model_copy`, not `model_validate`. Fifteen tests failed with
-   a `TypeError` at once; the serialisers now construct their nested models
-   explicitly, which is clearer than the shortcut was.
-5. **A whitespace-only diagnosis passed validation.** `Field(min_length=1)` is
-   satisfied by `"   "`, so a consultation could be saved with a blank
-   diagnosis — the single most important field in the record. Required text
-   fields now strip before checking. This one is worth dwelling on: the
-   server-rendered version had `if not diagnosis.strip()` in the route, and
-   moving validation into the schema silently dropped the `.strip()`. A
-   refactor can lose a check that no test was watching, which is why the test
-   asserting a blank diagnosis is rejected now exists.
-
-A test-isolation defect was also found and fixed: the password-change test left
-the shared account's password altered, breaking every test that ran after it.
-
-### 7.4 Availability assessment
-
-With compute and database in `ap-southeast-2a` only:
-
-| Failure | Consequence | Recovery |
-|---|---|---|
-| Application instance fails | Total outage | Manual relaunch and redeploy |
-| Presentation instance fails | Total outage | Manual relaunch |
-| RDS instance fails | Total outage, data intact | Restore from automated backup |
-| **AZ `ap-southeast-2a` fails** | **Total outage** | **Manual rebuild in `2b`** |
-| NAT Gateway fails | Service continues; S3 unaffected (gateway endpoint); OS updates and image builds fail | Recreate |
-| S3 unavailable | Note bodies unreadable, rendered as unavailable in place; rest of application works | Wait |
-
-The last row is the only graceful degradation in the system, and it exists
-because it was deliberately built and tested. Everything above it is a hard
-outage. That is the honest cost of a single-AZ deployment, and §8.2 gives the
-remediation.
-
-### 7.5 Indicative monthly cost
-
-`ap-southeast-2`, on-demand, excluding free-tier credits. Approximate.
-
-| Item | ~USD/month |
-|---|---|
-| EC2 `t3.micro` × 2 (presentation, application) | 19 |
-| RDS `db.t4g.micro`, 20 GB gp3, single-AZ | 17 |
-| **NAT Gateway** (hourly + data processing) | **35** |
-| Elastic IPs × 2 (one attached, one on the NAT) | 4 |
-| ECR storage (two repositories, 10 images retained) | 1 |
-| S3 storage and requests (low volume) | <1 |
-| EBS root volumes | 3 |
-| **Total** | **≈ 79** |
-
-The NAT Gateway is the largest single line — more than both compute tiers
-together. The S3 Gateway Endpoint is therefore not merely a
-networking nicety: it removes per-gigabyte NAT processing charges on the largest
-objects the system handles. The alternatives for reducing it further — a NAT
-*instance* on a `t3.nano`, or putting the application tier in the public subnet
-with no inbound rules — trade either self-managed NAT or the isolation property
-of §4.3, which is the substance of the design.
-
----
-
-## 8. Conclusion
-
-### 8.1 What was achieved
+### 7.1 What was achieved
 
 A hospital management application was written, tested and run, and a three-tier
 AWS architecture was designed and expressed as reproducible provisioning
@@ -1083,7 +946,7 @@ scripts. Against the objectives of §2:
 | O6 | Multi-AZ-ready addressing | Achieved in design: subnets in both zones, RDS subnet group spanning them |
 | O7 | Least privilege | Achieved: instance role scoped to two S3 actions on one prefix; security groups chained by group reference |
 | O8 | Reproducible provisioning | Achieved: `infra/` scripts, idempotent |
-| O9 | Be explicit about gaps | §7.2, §7.4, §8.2 |
+| O9 | Be explicit about gaps | §4.8, §7.2 |
 
 The central design decision is the one in §4.3: the application tier is private
 because its **route table has no path to an Internet Gateway**, not because a
@@ -1092,7 +955,7 @@ presence — a security-group error alone cannot expose it. Expressing that
 property correctly, and understanding why it is stronger, was the main learning
 outcome of the project.
 
-### 8.2 Limitations and what to do next
+### 7.2 Limitations and what to do next
 
 In the order a real deployment should address them:
 
@@ -1129,19 +992,26 @@ In the order a real deployment should address them:
    this size that becomes the dominant concern, and the scripts should be
    replaced by CloudFormation or Terraform.
 
-### 8.3 Reflection
+### 7.3 Reflection
 
-The most useful lesson was not architectural but methodological. Three of the
-defects in §7.3 — the 422 on an empty file input, the silently dropped
-attachments, and the 403 on presigned URLs — were invisible to reasoning about
-the code and surfaced only by exercising it against the real service. The second
-is the instructive one: it did not fail loudly. Notes saved successfully with
-the attachment discarded, and only a test that asserted the stored object
-existed caught it.
+Two lessons, one architectural and one methodological.
 
-Code that has not been exercised is a hypothesis, not a result. That is why
-§7.2 separates what was measured from what was reasoned about, rather than
-presenting analysis as though it were observation.
+The architectural one is the subject of §4.7: isolation is stronger when it
+comes from the **absence of a route** than from the presence of a rule. A
+security group is a statement about what is allowed; a routing table is a
+statement about what is *possible*. Getting that distinction right, and being
+able to say why the private subnet is safe even if a security group were
+misconfigured, was the most valuable thing learned.
+
+The methodological one concerns the defects fixed during implementation. Three
+of them — an empty file input rejected with a 422, attachments silently
+discarded by a type check that could never match, and presigned URLs rejected
+because they were signed against the wrong endpoint — were invisible to
+reasoning about the code and surfaced only by exercising it against the real
+service. The middle one is the instructive case: it did not fail loudly. Notes
+saved successfully with the attachment dropped, and only a test asserting that
+the stored object existed caught it. Code that has not been exercised is a
+hypothesis, not a result.
 
 ---
 
