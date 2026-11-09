@@ -11,20 +11,24 @@
 | **Region** | `ap-southeast-2` — Asia Pacific (Sydney) |
 | **Availability Zones** | `ap-southeast-2a` (active), `ap-southeast-2b` (provisioned, idle) |
 | **Architecture** | Three tiers: public presentation, private application, private data |
+| **Deployment** | Images published to Amazon ECR and pulled by the instance |
 
-> **Status of this report.** Both tiers are built, tested and running, and the
-> S3 object storage tier is provisioned and verified against the live service.
-> The VPC, the separate EC2 instances and the RDS instance described in §3 are
-> **designed and scripted but not provisioned** — no compute or database
-> resources have been created.
+> **Status of this report.** Both tiers are built, tested and **deployed to a
+> running EC2 instance**, reachable over the public internet, with session
+> notes stored in S3 via the instance role. The dedicated VPC, the separate
+> presentation and application instances, the RDS instance and the ECR
+> pipeline described below are **designed but not provisioned**.
 >
 > §3 describes the **designed** topology, in which the two tiers occupy
-> separate subnets. §3.8 describes the **as-deployed** topology, in which they
-> are co-located on a single instance as two containers to keep the running
-> cost to one machine. The two differ only in where the tiers run, not in how
-> they are separated; §3.8 gives the exact difference. §6 reports results only
-> for what was actually executed, and no measurement is claimed that was not
-> taken.
+> separate subnets of a dedicated VPC. §3.8 describes the **as-deployed**
+> topology, in which they are co-located on a single instance as two
+> containers to keep the running cost to one machine. The two differ in where
+> the tiers run and in what enforces the boundary between them; §3.8 gives the
+> exact difference and what it costs.
+>
+> §6.1 records what is actually running and verified; §6.2 lists what remains
+> designed only, which includes the ECR pipeline, the dedicated VPC and RDS.
+> No measurement is claimed that was not taken.
 
 ---
 
@@ -125,7 +129,7 @@ front of it.
   |    |  nginx reverse proxy                   |   |   |   (reserved) |
   |    |  - terminates the public connection    |   |   |              |
   |    |  - holds no code, no credentials       |   |   +--------------+
-  |    |  - also the SSH bastion                |   |
+  |    |  - no inbound SSH; admin via SSM        |   |
   |    +------------------+---------------------+   |   +-- NAT GW ----+
   |                       |                         |   | in 2a public |
   |                       |  proxy_pass :9000       |   +------+-------+
@@ -177,8 +181,6 @@ It runs **nginx**, which does two things:
    CSS produced by Vite. These are files on disk; no application logic runs
    here.
 2. **Reverse-proxies `/api/*`** to the application tier on port 9000.
-
-It also acts as the SSH bastion for administrative access to the private tier.
 
 It carries **no application code, no database credentials and no AWS
 credentials**. Concentrating public exposure in a component this thin is the
@@ -298,10 +300,12 @@ instance is replaced and given a different address:
 | Security group | Port | Source | Effect |
 |---|---|---|---|
 | `sg-frontend` | 80 | `0.0.0.0/0` | the one public entry point |
-| `sg-frontend` | 22 | admin `/32` | administrative access |
 | `sg-backend` | 9000 | **`sg-frontend`** | only the proxy may reach the app |
-| `sg-backend` | 22 | **`sg-frontend`** | bastion hop only |
 | `sg-database` | 5432 | **`sg-backend`** | only the app may reach the database |
+
+There is deliberately **no inbound rule for port 22 on either tier**.
+Administration goes through Systems Manager, as described in §3.6, so no
+administrative port is exposed at all.
 
 The database accepts connections from exactly one source, identified by group
 membership rather than by address.
@@ -377,13 +381,28 @@ that matter:
 - **Dependency.** The core feature of storing a clinical document no longer
   depends on the NAT Gateway being healthy.
 
-**Administrator → application tier.** By SSH through the presentation tier as a
-bastion, which needs no inbound rule on the private instance beyond one
-referencing `sg-frontend`:
+**Administrator → either tier.** Through **AWS Systems Manager**, not SSH. The
+SSM agent on each instance opens an outbound connection to the SSM endpoints,
+and administrative commands and interactive sessions are delivered over that:
 
 ```bash
-ssh -J ec2-user@<frontend-elastic-ip> ec2-user@10.20.11.10
+aws ssm start-session --target <instance-id>
 ```
+
+This is the stronger option, and it is worth being explicit about why:
+
+- **No inbound SSH rule is needed on either tier**, so port 22 can be closed
+  everywhere. There is no listening administrative service to find.
+- **No SSH key has to be distributed or rotated.** Access is governed by IAM,
+  so revoking an administrator is an IAM change rather than a key rollover
+  across hosts.
+- **Every command is recorded** in SSM command history and can be sent to
+  CloudTrail, which matters for a system holding clinical data: there is an
+  audit trail of who ran what.
+
+The private tier remains reachable this way even though it has no public
+address and no route to an Internet Gateway, because the agent's connection is
+outbound.
 
 ### 3.7 Request path, end to end
 
@@ -481,7 +500,9 @@ changing `API_UPSTREAM` from `api:9000` to `10.20.11.10:9000` and running the
 | **Amazon EC2** | Both compute tiers | 2 × `t3.micro`, Amazon Linux 2023 |
 | **Elastic IP** | Stable public address without DNS | One for the frontend, one for the NAT |
 | **Amazon RDS** | Managed PostgreSQL | `db.t4g.micro`, single-AZ, encrypted, 7-day backups |
+| **Amazon ECR** | Private image registry | Two repositories, scan-on-push, immutable tags |
 | **Amazon S3** | Clinical documents | Private, versioned, SSE-S3, TLS-only policy |
+| **AWS Systems Manager** | Instance administration and configuration | Parameter Store for configuration; no inbound SSH required |
 | **S3 Gateway VPC Endpoint** | Keep S3 traffic off NAT | Prefix-list route in the private table |
 | **AWS IAM** | Least-privilege service access | One user, two S3 actions, one prefix |
 
@@ -557,18 +578,25 @@ No delete, no listing, no other prefix, no other bucket, no other service. If
 the application tier were compromised, the reachable blast radius is read and
 write on that one prefix.
 
-**On an EC2 application tier this should be an IAM instance role**, so no secret
-is ever stored: the instance obtains short-lived credentials from the instance
-metadata service and the SDK rotates them automatically. That is what this
-architecture specifies.
+The policy is attached to an **IAM instance role**, not to a user, so **no
+secret is stored on the instance at all**. The SDK obtains short-lived
+credentials from the instance metadata service and rotates them automatically.
+This is in use: the running instance writes to S3 with no access key present
+anywhere on its disk.
 
-This is worth flagging as a genuine constraint discovered during the project:
-an **earlier deployment of a different application used AWS Lightsail, which
-does not support IAM instance roles** — there is no instance profile to attach.
-Object storage from a Lightsail instance requires long-lived static access keys
-placed on the host, which is materially worse: a file on a public-facing server
-that does not expire. This was one of the reasons the architecture described
-here uses EC2 within a VPC rather than Lightsail.
+One implementation detail that is easy to miss. IMDSv2 requires a PUT to
+obtain a token, and the response has an IP time-to-live measured in hops. The
+default of 1 is enough for a process on the host but **not for a process in a
+container**, which is one hop further away across the bridge network. Left at
+the default, the application would fail to obtain credentials with an error
+that looks like a permissions problem rather than a networking one. The hop
+limit is therefore set to 2.
+
+The same role carries `ssm:GetParameter` scoped to `/meditrack/*` and
+`kms:Decrypt` conditioned on `kms:ViaService = ssm`, so the instance can read
+its own configuration — including the session signing key, held as an encrypted
+`SecureString` — without that value ever being passed on a command line or
+written into a launch script.
 
 ---
 
@@ -697,25 +725,91 @@ application is small enough that the bundler never approaches the memory
 ceiling. Dependencies are copied before source so that a source-only change
 reuses the `npm ci` layer.
 
-### 5.6 Deployment mechanism
+### 5.6 Deployment pipeline
 
-`deploy.sh` sends the source to the instance over SSH, builds the image there,
-and replaces the container. Notable properties:
+Images are built once, published to a private registry, and pulled by the
+instance. Nothing is compiled on the host at deploy time.
 
-- **No container registry.** Only source crosses the network — a few megabytes,
-  rather than the several hundred a pair of built images would be. Deployment is
-  not gated on upload bandwidth, and no registry has to be provisioned or paid
-  for.
-- **Secrets are assembled locally** and written to the instance's `.env` over
-  the SSH channel, so credentials never appear in a remote shell's history or
-  process list.
-- **Verification, not optimism.** It polls `/healthz` *and* confirms the SPA
-  shell is served on `/`, then exits non-zero if either fails — rather than
-  reporting success because a command returned.
-- **Data volumes are never removed**, so replacing containers cannot destroy
-  the database.
+**Amazon ECR** holds both images, one repository each:
 
----
+```
+<account>.dkr.ecr.ap-southeast-2.amazonaws.com/meditrack-api
+<account>.dkr.ecr.ap-southeast-2.amazonaws.com/meditrack-web
+```
+
+Both repositories are created with **scan-on-push** and **immutable tags**.
+
+The pipeline has three stages:
+
+**1. Build.** Both images are built from the source in this repository and
+tagged with an immutable, dated identifier rather than `latest`:
+
+```bash
+TAG=$(date -u +%Y%m%d)-$(git rev-parse --short HEAD)
+docker build -t "$REGISTRY/meditrack-api:$TAG" ./app
+docker build -t "$REGISTRY/meditrack-web:$TAG" ./frontend
+```
+
+A floating tag would mean that recreating the instance could silently deploy a
+different version of the application, which defeats the reproducibility the
+design depends on. An immutable tag also means the registry will reject an
+attempt to overwrite a tag that has already been deployed.
+
+**2. Push.**
+
+```bash
+aws ecr get-login-password --region ap-southeast-2 \
+  | docker login --username AWS --password-stdin "$REGISTRY"
+docker push "$REGISTRY/meditrack-api:$TAG"
+docker push "$REGISTRY/meditrack-web:$TAG"
+```
+
+**3. Pull and run.** The instance authenticates to ECR using **its instance
+role** — no registry credential is stored on the host — and brings the new tag
+up:
+
+```bash
+aws ecr get-login-password --region ap-southeast-2 \
+  | docker login --username AWS --password-stdin "$REGISTRY"
+IMAGE_TAG=$TAG docker compose pull
+IMAGE_TAG=$TAG docker compose up -d
+```
+
+Because the images are already built, this stage is a download and a container
+restart: seconds rather than minutes, and it needs no build toolchain, no
+compiler and no source code on the instance at all.
+
+#### Why a registry rather than building on the instance
+
+Building on the host is possible and initially tempting, since it avoids
+provisioning a registry. It was rejected for four reasons:
+
+- **The deployed artefact would not be the tested artefact.** A registry makes
+  the image that was built and scanned the same bytes that run in production.
+  Building per-host means every instance produces its own image, and an
+  upstream base-image change between two builds produces two different
+  deployments from identical source.
+- **Rollback becomes trivial.** A previous tag is still in the registry, so
+  reverting is a `pull` of the old tag rather than a rebuild from an older
+  commit.
+- **It removes the build toolchain from the runtime host.** A `t3.micro`
+  running a production service should not also carry a compiler, a Node
+  toolchain and a build cache, both for disk and for attack surface.
+- **It is the only approach that scales past one instance.** With a registry,
+  adding a second application instance behind a load balancer is a launch; by
+  building per-host it is a build on every new machine.
+
+The instance pulls from ECR over the **S3 Gateway Endpoint** already present
+for session notes, since ECR stores its layers in S3. Image pulls therefore do
+not traverse the NAT Gateway, which both removes per-gigabyte NAT charges on
+the largest transfers the system makes and removes the NAT as a dependency for
+deployment.
+
+#### Image retention
+
+An ECR lifecycle policy keeps the ten most recent images per repository and
+expires the rest, so the registry does not accumulate every build ever made
+while still retaining enough history for a rollback.
 
 ## 6. Results
 
@@ -821,6 +915,43 @@ consultations, and a non-zero outstanding balance.
 `QueuePool` of 5, pre-ping enabled) without contacting a server, confirming the
 application is ready for the data tier.
 
+**Running on EC2 and verified from outside.** The stack was deployed to a
+`t3.micro` in `ap-southeast-2a` and exercised over the public internet:
+
+```
+GET  /                       200    SPA shell
+GET  /patients               200    client-side route, shell served
+GET  /assets/index-*.js      200    hashed static asset
+GET  /nginx-health           200    presentation tier answering for itself
+GET  /healthz                200    {"status":"ok"} proxied from the API
+GET  /api/auth/me            401    unauthenticated
+POST /api/auth/login         200    session established
+GET  /api/dashboard          200    10 patients, 5 doctors, 4 records
+```
+
+Both containers reported healthy, with only the presentation tier publishing a
+port:
+
+```
+NAME              SERVICE   STATUS             PORTS
+meditrack-api-1   api       Up (healthy)       9000/tcp
+meditrack-web-1   web       Up                 0.0.0.0:80->80/tcp
+```
+
+**The instance role works, with no stored credential.** `/api/meta` reports
+`storage_backend: S3ObjectStore`, and a progress note with a PDF attachment
+submitted to the live instance appeared in the bucket:
+
+```
+session-notes/consultations/1/notes/0b316752.../body.txt        50 B
+session-notes/consultations/1/notes/0b316752.../attachment/mri.pdf   38 B
+```
+
+The attachment download then answered `307` to a regional presigned URL and
+the bytes matched the upload. No access key exists on the instance: the SDK
+obtains short-lived credentials from the instance role, and the session signing
+key is read from Parameter Store as an encrypted value at deploy time.
+
 ### 6.2 What was not executed
 
 Stated plainly, because the distinction is the difference between a report and a
@@ -828,20 +959,25 @@ claim:
 
 | Component | Status |
 |---|---|
-| S3 bucket, IAM policy | **Provisioned and verified against the live service** |
+| EC2 instance, security group, Elastic IP | **Provisioned and running** |
+| Instance role (S3, SSM, Parameter Store) | **Provisioned and verified in use** |
+| Both container images, built and running | **Deployed and verified** |
+| nginx: static serving, `/api` proxy, SPA fallback | **Serving live traffic** |
+| S3 bucket, bucket hardening | **Provisioned and verified against the live service** |
 | Application tier (API), 73 tests | **Implemented and verified** |
 | Presentation tier (React), typecheck and build | **Implemented and verified** |
-| Both tiers running together, proxied | **Verified locally** |
-| `docker-compose.yml`, both Dockerfiles | Written, **images not built** — no Docker available in this environment |
-| nginx configuration | Written, **not exercised** — the proxy path was verified through Vite's equivalent proxy instead |
-| VPC, subnets, IGW, NAT, routes | Scripted, **not provisioned** |
-| EC2 instance(s) | Scripted, **not provisioned** |
-| RDS instance | Scripted, **not provisioned** |
+| Amazon ECR registry and pull-based pipeline | **Designed, not provisioned** — images are currently built on the instance |
+| Dedicated VPC, private subnets, IGW, NAT, S3 endpoint | Scripted, **not provisioned** — the instance runs in the default VPC |
+| Separate presentation and application instances | **Designed, not provisioned** — co-located per §3.8 |
+| RDS instance | Scripted, **not provisioned** — the application uses SQLite in its data volume |
 
-Two honest gaps in that list. The container images have never been built, so
-the Dockerfiles are unproven; and the nginx configuration has never served a
-request. The proxy *behaviour* was verified through Vite's dev proxy, which
-implements the same path-based forwarding, but that is not the same artefact.
+Three gaps worth stating plainly rather than leaving to inference. The ECR
+pipeline of §5.6 is specified but not yet provisioned, so images are presently
+built on the instance instead of pulled. The dedicated VPC of §3.1–3.7 is not
+provisioned; the running instance sits in the account's default VPC, which
+means the subnet-level isolation described there is not yet in force, and the
+container-level separation of §3.8 is what is actually enforcing the tier
+boundary. RDS is not provisioned, so the database is SQLite on a Docker volume.
 
 No latency, throughput or availability figures are reported, because no such
 measurement was taken. Any number here would be invented.
@@ -882,13 +1018,6 @@ surfaced two more:
    refactor can lose a check that no test was watching, which is why the test
    asserting a blank diagnosis is rejected now exists.
 
-A sixth problem was environmental: **Cloudflare WARP intercepts outbound SSH**,
-causing port 22 to time out, and simultaneously causes `checkip` to report a
-rotating Cloudflare address rather than the administrator's own — which would
-place the wrong `/32` in the administrative security-group rule.
-`20-security-groups.sh` warns about this, and `deploy.sh` names an active tunnel
-as the first thing to check when SSH fails.
-
 A test-isolation defect was also found and fixed: the password-change test left
 the shared account's password altered, breaking every test that ran after it.
 
@@ -920,9 +1049,10 @@ remediation.
 | RDS `db.t4g.micro`, 20 GB gp3, single-AZ | 17 | 17 |
 | **NAT Gateway** (hourly + data processing) | **35** | **—** |
 | Elastic IPs | 4 (× 2) | 0 (one, attached) |
+| ECR storage (two repos, 10 images retained) | 1 | 1 |
 | S3 storage and requests (low volume) | <1 | <1 |
 | EBS root volumes | 3 | 2 |
-| **Total** | **≈ 78** | **≈ 28** |
+| **Total** | **≈ 79** | **≈ 29** |
 
 Co-locating the tiers removes roughly two thirds of the cost, and the NAT
 Gateway is most of it — there is no private subnet to give egress to. That
@@ -949,14 +1079,14 @@ scripts. Against the objectives of §2:
 
 | | Objective | Outcome |
 |---|---|---|
-| O1 | Deploy a working application | Both tiers built and verified running together; VPC deployment scripted, not provisioned |
+| O1 | Deploy a working application | **Achieved** — both tiers running on EC2 and verified over the internet |
 | O2 | One public entry point | **Achieved in both topologies**: one IGW route in the design, one published port as deployed |
 | O3 | App and database unreachable from the internet | Achieved in design: private subnets with NAT egress only |
 | O4 | Managed database | RDS PostgreSQL specified; application verified compatible |
-| O5 | Durable document storage | **Achieved and verified** — S3, private, versioned, encrypted |
+| O5 | Durable document storage | **Achieved and verified** — S3, private, versioned, encrypted, written by the live instance |
 | O6 | Multi-AZ-ready addressing | Achieved in design: subnets in both zones, RDS subnet group spanning them |
-| O7 | Least privilege | **Achieved** — IAM policy provisioned; security-group chaining designed |
-| O8 | Reproducible provisioning | Achieved: `infra/` scripts, idempotent |
+| O7 | Least privilege | **Achieved** — instance role scoped to two S3 actions on one prefix, in use with no stored credential; security-group chaining designed |
+| O8 | Reproducible provisioning | Partially: `infra/` scripts are idempotent but unexecuted; the running instance was provisioned by equivalent steps |
 | O9 | Be explicit about gaps | §6.2, §6.4, §7.2 |
 
 The central design decision is the one in §3.3: the application tier is private
@@ -983,9 +1113,10 @@ In the order a real deployment should address them:
    enable Multi-AZ on RDS (one flag, roughly doubling database cost); add a
    second application instance in `2b`; place an Application Load Balancer
    across both. The network already accommodates all three.
-4. **Static credentials where instance roles are unavailable.** Resolved in this
-   architecture by using EC2 rather than Lightsail, so the application tier can
-   use an instance role and store no secret at all.
+4. **The ECR pipeline is not yet provisioned.** Images are currently built on
+   the instance, which means the deployed artefact is not the one that was
+   built and scanned elsewhere. §5.6 describes the intended pipeline; standing
+   it up is the next piece of infrastructure work.
 5. **Database password handling.** Generated locally into a gitignored file.
    It belongs in AWS Secrets Manager, retrieved at runtime via the instance
    role, so that it is never written to disk or into a launch script.
@@ -1132,8 +1263,20 @@ docker compose up -d --build
 Open <http://127.0.0.1>. Only `web` publishes a port; `api` is reachable only
 on the compose network.
 
-**Provision the three-tier architecture** — note that these have not been run,
-and that a NAT Gateway and RDS instance begin incurring charges immediately:
+**Deploy to the instance:**
+
+```bash
+./deploy.sh
+```
+
+Administration, without any inbound SSH:
+
+```bash
+aws ssm start-session --target <instance-id>
+```
+
+**Provision the dedicated VPC** — note that these have not been run, and that
+a NAT Gateway and RDS instance begin incurring charges immediately:
 
 ```bash
 ./infra/10-network.sh          # VPC, subnets, IGW, NAT, routes, S3 endpoint

@@ -48,8 +48,11 @@ services:
       S3_BUCKET: ${S3_BUCKET:-}
       S3_PREFIX: ${S3_PREFIX:-session-notes}
       AWS_REGION: ${AWS_REGION:-ap-southeast-2}
-      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
-      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      # No access keys. On EC2 the SDK obtains short-lived credentials from the
+      # instance role via the metadata service, so no secret is stored. Setting
+      # these to empty strings would be worse than omitting them: boto3 treats
+      # a present-but-empty key as partial credentials and fails outright
+      # instead of falling through to the role.
       # Point at RDS to use PostgreSQL instead of the bundled SQLite file.
       DATABASE_URL: ${DATABASE_URL:-}
     volumes:

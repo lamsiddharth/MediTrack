@@ -8,7 +8,7 @@ Docker. Written for this project rather than vendored from elsewhere.
 | **Presentation tier** | React 19 + TypeScript (Vite), served by nginx |
 | **Application tier** | Python / FastAPI JSON API, SQLAlchemy |
 | **Database** | SQLite by default; PostgreSQL / RDS via `DATABASE_URL` |
-| **Image delivery** | Source sent to the instance over SSH and built there. No registry, no local Docker. |
+| **Deployment** | Over AWS Systems Manager. No SSH, no inbound port 22. |
 | **Session notes** | Stored in S3 (`meditrack-session-notes-808122334310`, ap-southeast-2) |
 | **Cloud** | AWS EC2 — `t3.micro`, Amazon Linux 2023 |
 | **Sign in** | `admin` / `admin123` — change it immediately after first login |
@@ -80,8 +80,8 @@ to start genuinely empty.
 | `frontend/` | **Presentation tier**: React SPA plus the nginx configuration that serves it and proxies `/api`. |
 | `docker-compose.yml` | Runs both tiers on one instance as two containers. |
 | `infra/` | Scripts for the two-subnet VPC architecture in `REPORT.md` §3. Not run. |
-| `bootstrap.sh` | Instance user-data. Swap, Docker, Compose plugin. Pass it verbatim; needs no credentials. |
-| `deploy.sh` | Sends both tiers to the instance, builds there, starts the stack, verifies health. |
+| `bootstrap.sh` | Instance user-data. Swap, Docker, and the Compose and buildx CLI plugins. Pass it verbatim. |
+| `deploy.sh` | Deploys both tiers over AWS Systems Manager. No SSH, no inbound port 22. |
 | `REPORT.md` | Project report: problem, objectives, architecture, services, implementation, results. |
 
 ---
@@ -175,11 +175,8 @@ and a bucket policy denying any request not over TLS.
 
 ### Credentials
 
-The existing instance is **Lightsail**, which has no IAM instance roles — there
-is no instance profile to attach, so the container cannot pick up temporary
-credentials the way an EC2 instance would. It therefore needs static keys.
-
-An IAM user `meditrack-app` exists with exactly this policy and nothing else:
+**There are none to manage.** The instance has an IAM role, `meditrack-instance`,
+carrying exactly:
 
 ```json
 {
@@ -189,35 +186,33 @@ An IAM user `meditrack-app` exists with exactly this policy and nothing else:
 }
 ```
 
-No delete, no listing, no other bucket, no other service. If the instance is
-compromised, the blast radius is read/write on that one prefix.
+plus read access to `/meditrack/*` in Parameter Store and `AmazonSSMManagedInstanceCore`.
+No delete, no listing, no other bucket, no other service. The SDK obtains
+short-lived credentials from the instance metadata service, so no access key
+exists on the instance.
 
-Create an access key for it and write the result to `.aws-app-credentials`
-(gitignored), which `deploy.sh` reads:
+Configuration lives in Parameter Store and is read by the instance at deploy
+time:
 
-```bash
-AWS_PROFILE=new aws iam create-access-key --user-name meditrack-app \
-  --query 'AccessKey.[AccessKeyId,SecretAccessKey]' --output text
-```
+| Parameter | Type |
+|---|---|
+| `/meditrack/secret-key` | SecureString — signs session cookies |
+| `/meditrack/s3-bucket` | String |
+| `/meditrack/s3-prefix` | String |
+| `/meditrack/database-url` | SecureString — optional; set to use RDS |
 
-```
-# .aws-app-credentials
-AWS_ACCESS_KEY_ID=...
-AWS_SECRET_ACCESS_KEY=...
-AWS_REGION=ap-southeast-2
-S3_BUCKET=meditrack-session-notes-808122334310
-S3_PREFIX=session-notes
-```
-
-`chmod 600` it. Without this file `deploy.sh` falls back to local storage on
-the instance, which works but keeps notes on one disk with no backup.
-
-Rotate the key if it is ever exposed:
+To rotate the session key:
 
 ```bash
-AWS_PROFILE=new aws iam list-access-keys --user-name meditrack-app
-AWS_PROFILE=new aws iam delete-access-key --user-name meditrack-app --access-key-id <old>
+aws ssm put-parameter --name /meditrack/secret-key --type SecureString \
+  --value "$(head -c 32 /dev/urandom | base64 | tr -d '=+/')" --overwrite
+./deploy.sh
 ```
+
+> If you run the application tier in a container, the IMDS hop limit must be
+> at least 2. The default of 1 is enough for the host but not for a process one
+> hop further away on a bridge network, and the resulting failure looks like a
+> permissions problem rather than a networking one.
 
 ### How attachments are served
 
@@ -237,17 +232,14 @@ which keeps large files off a 1 GiB box.
 ### Prerequisites
 
 - AWS CLI v2, configured: `aws configure --profile <name>`
-- `bash`, `curl`, `tar`, `ssh`. No Docker needed locally.
+- `bash`, `curl`, `tar`. No Docker and no SSH client needed locally.
 
 ```bash
 export AWS_PROFILE=<name> AWS_DEFAULT_REGION=ap-southeast-2
 ```
 
-> **Turn off Cloudflare WARP (or any VPN) before deploying.** It intercepts
-> outbound SSH, and it also makes `checkip` report a rotating Cloudflare address,
-> which would put the wrong IP in your port-22 rule. `deploy.sh` checks for this
-> and says so. Verify with:
-> `curl -s https://www.cloudflare.com/cdn-cgi/trace | grep warp=`
+`deploy.sh` uses AWS Systems Manager, so no inbound SSH is needed and no
+port 22 rule is required on the security group.
 
 ### 1. Allocate the Elastic IP first
 
@@ -259,41 +251,92 @@ echo "$IP" > .static-ip
 echo "$IP"
 ```
 
-### 2. Key pair and security group
+### 2. Security group
+
+Only port 80. Administration goes through Systems Manager, so there is no
+inbound SSH rule and no key pair to manage.
 
 ```bash
-aws ec2 create-key-pair --key-name meditrack-key \
-  --query KeyMaterial --output text > ~/.ssh/meditrack-key.pem
-chmod 600 ~/.ssh/meditrack-key.pem
-
-MYIP=$(curl -fsS https://checkip.amazonaws.com)
+VPC=$(aws ec2 describe-vpcs --query 'Vpcs[?IsDefault].VpcId' --output text)
 SG=$(aws ec2 create-security-group --group-name meditrack-sg \
-      --description "MediTrack web + admin SSH" --query GroupId --output text)
+      --description "MediTrack web" --vpc-id "$VPC" --query GroupId --output text)
 
 aws ec2 authorize-security-group-ingress --group-id "$SG" \
   --protocol tcp --port 80 --cidr 0.0.0.0/0
-aws ec2 authorize-security-group-ingress --group-id "$SG" \
-  --protocol tcp --port 22 --cidr "${MYIP}/32"
 ```
 
-> Write the key to `~/.ssh/`, not into this directory. On WSL, Windows drive
-> mounts under `/mnt/c` cannot represent Unix permission bits, so the file stays
-> world-readable and SSH refuses to use it.
+### 3. Instance role
 
-### 3. Launch
+The instance needs to reach S3, read its configuration, and be reachable by
+Systems Manager. All three come from one role, so nothing is stored on the host.
+
+```bash
+BUCKET=meditrack-session-notes-808122334310
+ACCT=$(aws sts get-caller-identity --query Account --output text)
+
+cat > /tmp/trust.json <<'EOF'
+{"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+ "Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}
+EOF
+
+aws iam create-role --role-name meditrack-instance \
+  --assume-role-policy-document file:///tmp/trust.json
+
+cat > /tmp/policy.json <<EOF
+{"Version":"2012-10-17","Statement":[
+ {"Effect":"Allow","Action":["s3:PutObject","s3:GetObject"],
+  "Resource":"arn:aws:s3:::${BUCKET}/session-notes/*"},
+ {"Effect":"Allow","Action":["s3:GetObject"],
+  "Resource":"arn:aws:s3:::${BUCKET}/deploy/*"},
+ {"Effect":"Allow","Action":["ssm:GetParameter","ssm:GetParameters"],
+  "Resource":"arn:aws:ssm:ap-southeast-2:${ACCT}:parameter/meditrack/*"},
+ {"Effect":"Allow","Action":["kms:Decrypt"],"Resource":"*",
+  "Condition":{"StringEquals":{"kms:ViaService":"ssm.ap-southeast-2.amazonaws.com"}}}
+]}
+EOF
+
+aws iam put-role-policy --role-name meditrack-instance \
+  --policy-name meditrack-s3-session-notes --policy-document file:///tmp/policy.json
+
+aws iam attach-role-policy --role-name meditrack-instance \
+  --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+aws iam create-instance-profile --instance-profile-name meditrack-instance
+aws iam add-role-to-instance-profile \
+  --instance-profile-name meditrack-instance --role-name meditrack-instance
+```
+
+### 4. Store the configuration
+
+```bash
+aws ssm put-parameter --name /meditrack/secret-key --type SecureString \
+  --value "$(head -c 32 /dev/urandom | base64 | tr -d '=+/')" --overwrite
+aws ssm put-parameter --name /meditrack/s3-bucket --type String \
+  --value meditrack-session-notes-808122334310 --overwrite
+aws ssm put-parameter --name /meditrack/s3-prefix --type String \
+  --value session-notes --overwrite
+```
+
+### 5. Launch
 
 ```bash
 AMI=$(aws ssm get-parameter \
   --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 \
   --query 'Parameter.Value' --output text)
 
+SUBNET=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC" \
+  "Name=availability-zone,Values=ap-southeast-2a" \
+  --query 'Subnets[0].SubnetId' --output text)
+
 INSTANCE=$(aws ec2 run-instances \
   --image-id "$AMI" \
   --instance-type t3.micro \
-  --key-name meditrack-key \
   --security-group-ids "$SG" \
-  --block-device-mappings 'DeviceName=/dev/xvda,Ebs={VolumeSize=12,VolumeType=gp3}' \
+  --subnet-id "$SUBNET" \
+  --iam-instance-profile Name=meditrack-instance \
+  --block-device-mappings 'DeviceName=/dev/xvda,Ebs={VolumeSize=16,VolumeType=gp3,DeleteOnTermination=true}' \
   --user-data "file://bootstrap.sh" \
+  --metadata-options "HttpTokens=required,HttpPutResponseHopLimit=2" \
   --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=meditrack}]' \
   --query 'Instances[0].InstanceId' --output text)
 
@@ -301,27 +344,32 @@ aws ec2 wait instance-running --instance-ids "$INSTANCE"
 aws ec2 associate-address --instance-id "$INSTANCE" --allocation-id "$ALLOC"
 ```
 
-No `--iam-instance-profile`: the instance needs no AWS permissions.
+> `HttpPutResponseHopLimit=2` is required. IMDSv2 token responses carry an IP
+> hop limit, and the default of 1 is enough for the host but not for a process
+> in a container one hop further away. Left at 1, the application cannot obtain
+> credentials and the failure reads as a permissions error.
 
-Wait for the bootstrap to install Docker:
-
-```bash
-ssh -i ~/.ssh/meditrack-key.pem ec2-user@"$IP" \
-  'while [ ! -f /opt/bootstrap-done ]; do sleep 5; done; echo ready'
-```
-
-### 4. Deploy
+Wait for the bootstrap to finish — it installs Docker and the Compose and
+buildx plugins:
 
 ```bash
-PUBLIC_IP="$IP" ./deploy.sh
+aws ssm describe-instance-information \
+  --filters "Key=InstanceIds,Values=$INSTANCE" \
+  --query 'InstanceInformationList[0].PingStatus' --output text   # expect Online
 ```
 
-The transfer is under a megabyte and the build takes a minute or two — there is
-no frontend toolchain and no separate database server, which is why this fits a
-`t3.micro` comfortably. `deploy.sh` polls `/healthz` and exits non-zero if the
-app does not come up.
+### 6. Deploy
 
-### 5. Sign in and change the password
+```bash
+./deploy.sh
+```
+
+It finds the instance by its `Name=meditrack` tag, stages the source in S3,
+and instructs the instance over Systems Manager to pull it, assemble its
+configuration from Parameter Store, and bring the stack up. It then polls the
+public URL and exits non-zero if the application does not answer.
+
+### 7. Sign in and change the password
 
 Open `http://$IP`, sign in with `admin` / `admin123`, then go to **Account** and
 change it. The instance is publicly reachable on port 80.
@@ -330,29 +378,51 @@ change it. The instance is publicly reachable on port 80.
 
 ## Operating it
 
+No SSH. Administration goes through Systems Manager:
+
 ```bash
-IP="$(cat .static-ip)"
-ssh -i ~/.ssh/meditrack-key.pem ec2-user@"$IP"
-cd ~/meditrack
+export AWS_PROFILE=new AWS_REGION=ap-southeast-2
+INSTANCE=$(aws ec2 describe-instances --filters "Name=tag:Name,Values=meditrack" \
+  "Name=instance-state-name,Values=running" \
+  --query 'Reservations[0].Instances[0].InstanceId' --output text)
 
-sudo docker compose ps              # both tiers and their health
-sudo docker compose logs -f api     # application logs
-sudo docker compose logs -f web     # nginx access and error logs
-sudo docker stats --no-stream
+# Interactive shell
+aws ssm start-session --target "$INSTANCE"
 
-# The API is not reachable from the host, by design. To reach it:
-sudo docker compose exec api python -c \
+# Or a one-off command
+aws ssm send-command --instance-ids "$INSTANCE" \
+  --document-name AWS-RunShellScript \
+  --parameters 'commands=["cd /opt/meditrack && docker compose ps"]'
+```
+
+Once in a session:
+
+```bash
+cd /opt/meditrack
+docker compose ps                 # both tiers and their health
+docker compose logs -f api        # application logs
+docker compose logs -f web        # nginx access and error logs
+
+# The API publishes no host port, by design. To reach it:
+docker compose exec api python -c \
   "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:9000/healthz').read())"
 ```
 
 Back up the database:
 
 ```bash
-IP="$(cat .static-ip)"
-ssh -i ~/.ssh/meditrack-key.pem ec2-user@"$IP" \
-  'docker run --rm -v meditrack-data:/d -v /tmp:/b alpine \
-     tar czf /b/meditrack-backup.tar.gz -C /d .'
-scp -i ~/.ssh/meditrack-key.pem ec2-user@"$IP":/tmp/meditrack-backup.tar.gz .
+aws ssm send-command --instance-ids "$INSTANCE" \
+  --document-name AWS-RunShellScript \
+  --parameters 'commands=["docker run --rm -v meditrack_meditrack-data:/d -v /tmp:/b alpine tar czf /b/backup.tar.gz -C /d ."]'
+```
+
+Then copy it off the instance via S3, since there is no SSH channel:
+
+```bash
+aws ssm send-command --instance-ids "$INSTANCE" \
+  --document-name AWS-RunShellScript \
+  --parameters 'commands=["aws s3 cp /tmp/backup.tar.gz s3://meditrack-session-notes-808122334310/deploy/backup.tar.gz --region ap-southeast-2"]'
+aws s3 cp s3://meditrack-session-notes-808122334310/deploy/backup.tar.gz .
 ```
 
 ## Updating after a change
@@ -375,8 +445,15 @@ pip layer.
 aws ec2 terminate-instances --instance-ids "$INSTANCE"
 aws ec2 wait instance-terminated --instance-ids "$INSTANCE"
 aws ec2 release-address --allocation-id "$ALLOC"
-aws ec2 delete-key-pair --key-name meditrack-key
 aws ec2 delete-security-group --group-id "$SG"
+aws iam remove-role-from-instance-profile \
+  --instance-profile-name meditrack-instance --role-name meditrack-instance
+aws iam delete-instance-profile --instance-profile-name meditrack-instance
+aws iam delete-role-policy --role-name meditrack-instance \
+  --policy-name meditrack-s3-session-notes
+aws iam detach-role-policy --role-name meditrack-instance \
+  --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+aws iam delete-role --role-name meditrack-instance
 ```
 
 Release the Elastic IP: an allocated address not associated with a running
