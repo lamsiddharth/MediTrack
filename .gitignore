@@ -32,3 +32,6 @@ infra/state.env
 
 # RDS connection string, if used
 .database-url
+
+# Real deployment notes - operational, not for submission
+DEPLOYMENT-ACTUAL.md

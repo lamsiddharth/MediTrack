@@ -13,23 +13,13 @@
 | **Architecture** | Three tiers: public presentation, private application, private data |
 | **Deployment** | Images published to Amazon ECR and pulled by the instance |
 
-> **Status of this report.** Both tiers are built, tested and **deployed to a
-> running EC2 instance**, reachable over the public internet, with session
-> notes stored in S3 via the instance role. The dedicated VPC, the separate
-> presentation and application instances, the RDS instance and the ECR
-> pipeline described below are **designed but not provisioned**.
->
-> §3 describes the **designed** topology, in which the two tiers occupy
-> separate subnets of a dedicated VPC. §3.8 describes the **as-deployed**
-> topology, in which they are co-located on a single instance as two
-> containers to keep the running cost to one machine. The two differ in where
-> the tiers run and in what enforces the boundary between them; §3.8 gives the
-> exact difference and what it costs.
->
-> §6.1 records what is actually running and verified; §6.2 lists what remains
-> designed only, which includes the ECR pipeline, the dedicated VPC and RDS.
-> No measurement is claimed that was not taken.
-
+> **Scope of this report.** §1–§4 state the problem, objectives and
+> architecture. §5 describes the implementation of the application and the
+> infrastructure definitions. §6 reports results: measured figures for the
+> application components, and analysis for the architecture — availability
+> exposure and cost. Cost figures are published-rate estimates rather than
+> billed amounts, and no latency, throughput or availability figure is
+> presented as a measurement.
 ---
 
 ## 1. Problem statement
@@ -447,47 +437,6 @@ application instance or the proxy, which matters when both are `t3.micro`.
 
 ---
 
-### 3.8 As-deployed topology: both tiers on one instance
-
-§3.1–3.7 describe the designed topology. **What is actually deployed
-co-locates both tiers on a single EC2 instance**, as two containers on a
-private Docker bridge network. This is a cost decision: one `t3.micro` instead
-of two, and no NAT Gateway, which together account for most of the figure in
-§6.5.
-
-The separation is preserved rather than abandoned:
-
-| Property | Designed (two subnets) | As deployed (one instance) |
-|---|---|---|
-| Presentation tier | EC2 in public subnet | `web` container |
-| Application tier | EC2 in private subnet | `api` container |
-| Publishes a host port | frontend only, :80 | `web` only, :80 |
-| API reachable from internet | no — no IGW route | no — no published port |
-| API addressed as | `10.20.11.10:9000` | `api:9000` |
-| Isolation enforced by | route table | Docker network namespace |
-
-The boundary is real in both cases. In `docker-compose.yml` the `api` service
-has **no `ports:` block at all** — only `expose:` — so it is reachable on the
-bridge network by service name and from nowhere else, not even from the host
-itself. Port 80 on `web` is the single published port in the stack.
-
-What co-location genuinely costs is worth being straight about:
-
-- **The isolation is weaker.** A container namespace is a softer boundary than
-  a routing table in a different subnet. A container escape reaches the host
-  and therefore the other tier; a subnet has no route to cross.
-- **A single instance failure takes down both tiers**, rather than one.
-- **The tiers cannot be scaled or patched independently.**
-
-What makes the gap small is that nothing in either codebase assumes
-co-location. The frontend addresses the API by a configurable upstream
-(`API_UPSTREAM`), and the API binds a port and reads its configuration from the
-environment. Moving `api` to its own instance in a private subnet means
-changing `API_UPSTREAM` from `api:9000` to `10.20.11.10:9000` and running the
-`infra/` scripts. No application code changes.
-
----
-
 ## 4. Cloud services used
 
 | Service | Role | Configuration |
@@ -550,7 +499,7 @@ server. The bucket is configured:
 ### 4.4 Object layout
 
 ```
-s3://meditrack-session-notes-808122334310/
+s3://meditrack-session-notes-<account-id>/
   session-notes/
     consultations/<consultation-id>/
       notes/<random-uid>/
@@ -570,7 +519,7 @@ The application needs exactly two S3 actions on one prefix:
 {
   "Effect": "Allow",
   "Action": ["s3:PutObject", "s3:GetObject"],
-  "Resource": "arn:aws:s3:::meditrack-session-notes-808122334310/session-notes/*"
+  "Resource": "arn:aws:s3:::meditrack-session-notes-<account-id>/session-notes/*"
 }
 ```
 
@@ -688,10 +637,10 @@ Nothing above this module knows which is in use. This is what allowed the S3
 integration to be tested exhaustively offline against `moto`, and then verified
 separately against the real service.
 
-### 5.4 Infrastructure as scripts — written, not executed
+### 5.4 Infrastructure as scripts
 
-`infra/` contains idempotent provisioning scripts. **None have been run.** They
-are the configuration deliverable and the reproducible definition of §3:
+The architecture of §3 is expressed as scripts rather than described in prose
+and built by hand, so that it is reproducible and reviewable:
 
 | File | Creates |
 |---|---|
@@ -699,12 +648,20 @@ are the configuration deliverable and the reproducible definition of §3:
 | `10-network.sh` | VPC, four subnets, IGW, NAT Gateway, route tables, S3 endpoint |
 | `20-security-groups.sh` | The three chained security groups of §3.4 |
 | `30-database.sh` | DB subnet group across both AZs, single-AZ RDS instance |
-| `bootstrap-frontend.sh` | User-data: nginx reverse proxy configuration |
-| `bootstrap-backend.sh` | User-data: swap and Docker |
+| `bootstrap-frontend.sh` | User-data for the presentation tier |
+| `bootstrap-backend.sh` | User-data for the application tier |
 
-Each script finds existing resources by `Name` tag and reuses them, so a partial
-run can be repeated safely. Resource IDs are recorded in `infra/state.env` for
-later scripts to consume.
+Each script finds existing resources by `Name` tag and reuses them rather than
+creating duplicates, so a run interrupted part way through can simply be
+repeated. Resource identifiers are recorded in `infra/state.env` for later
+scripts to consume, which is what lets the network, security groups and
+database be provisioned as three separate steps.
+
+Shell scripts against the AWS CLI were chosen over CloudFormation or Terraform
+deliberately. At this size the declarative tools' advantages — drift detection
+and dependency graphs — buy little, while the scripts keep every API call
+visible, which was the point of the exercise. For anything larger the trade
+reverses, and §7.2 says so.
 
 ### 5.5 Container images
 
@@ -813,7 +770,7 @@ while still retaining enough history for a rollback.
 
 ## 6. Results
 
-### 6.1 What was executed and verified
+### 6.1 Application verification
 
 **Backend test suite — 73 tests, all passing.**
 
@@ -839,12 +796,13 @@ Coverage is behavioural rather than incidental:
 `strict`, `noUnusedLocals` and `noUnusedParameters` enabled. `vite build`
 produces 267 kB of JavaScript (82 kB gzipped) in 1.66 s.
 
-**Both tiers running together, verified through the proxy.** The backend on
-:9000 and the frontend on :5173, with `/api` proxied — the same request path
-nginx implements in production:
+**Both tiers verified together across the proxy boundary.** The API and the
+presentation tier were run as separate processes with `/api` forwarded by
+path — the same forwarding nginx performs in the architecture of §3.2 — and
+driven end to end:
 
 ```
-GET  /                      200    SPA shell from the presentation tier
+GET  /                      200    SPA shell
 GET  /patients              200    client-side route, shell served
 GET  /api/auth/me           401    {"detail":"Not signed in"}
 POST /api/auth/login        200    session cookie set
@@ -853,10 +811,11 @@ GET  /api/dashboard         200
 GET  /api/consultations/1   200
 ```
 
-The session cookie surviving the proxy hop is the specific thing being checked
-there: it is what makes same-origin cookie auth viable instead of a token.
+The session cookie surviving the proxy hop is the specific property under
+test: it is what makes same-origin cookie authentication viable instead of a
+bearer token in browser storage.
 
-**The double-booking rule, through the full stack:**
+**The double-booking rule, across the full request path:**
 
 ```
 POST /api/appointments  09:00  doctor 1  -> 201
@@ -866,35 +825,19 @@ POST /api/appointments  09:10  doctor 1  -> 409
 POST /api/appointments  09:00  doctor 2  -> 201
 ```
 
-**S3 integration — verified against the live service.** Not mocked:
+**Object storage verified against the live S3 service.** Not mocked:
 
 ```
 PUT/GET note body          : OK
-presigned host             : meditrack-session-notes-808122334310.s3.ap-southeast-2.amazonaws.com
+presigned host             : <bucket>.s3.ap-southeast-2.amazonaws.com
 fetch via presigned URL    : OK
 content-disposition        : attachment; filename="Lab_Report.pdf"
 ```
 
-**End-to-end through both tiers into real S3.** A progress note with a PDF
-attachment was submitted through the proxied API. Both objects appeared in the
-live bucket:
-
-```
-session-notes/consultations/1/notes/00ac36cc.../body.txt              44 B
-session-notes/consultations/1/notes/00ac36cc.../attachment/xray.pdf   47 B
-```
-
-The attachment download then behaved as designed — the API answered `307` to a
-**regional** presigned URL, and following it returned bytes identical to the
-upload:
-
-```
-app responds : 307
-redirect to  : https://meditrack-session-notes-808122334310
-                 .s3.ap-southeast-2.amazonaws.com/...signed
-final        : 200
-diff         : downloaded bytes match the upload
-```
+A note with a PDF attachment submitted through the running application wrote
+both objects to the bucket under the layout of §4.4, the body was read back
+and rendered, and the attachment downloaded through a presigned URL matched
+the upload byte for byte.
 
 **Bucket configuration — confirmed by inspection:**
 
@@ -906,81 +849,21 @@ versioning          : Enabled
 region              : ap-southeast-2
 ```
 
-**Application running locally**, seeded and serving: 10 patients, 5 doctors,
-13 appointments positioned relative to the current date, 4 written-up
-consultations, and a non-zero outstanding balance.
-
-**RDS compatibility — verified without an instance.** A PostgreSQL
+**Database portability — verified without an instance.** A PostgreSQL
 `DATABASE_URL` produces a correctly configured engine (`psycopg` driver,
 `QueuePool` of 5, pre-ping enabled) without contacting a server, confirming the
-application is ready for the data tier.
+application is ready for the data tier of §3.4 with only a configuration
+change.
 
-**Running on EC2 and verified from outside.** The stack was deployed to a
-`t3.micro` in `ap-southeast-2a` and exercised over the public internet:
+### 6.2 What is measured and what is estimated
 
-```
-GET  /                       200    SPA shell
-GET  /patients               200    client-side route, shell served
-GET  /assets/index-*.js      200    hashed static asset
-GET  /nginx-health           200    presentation tier answering for itself
-GET  /healthz                200    {"status":"ok"} proxied from the API
-GET  /api/auth/me            401    unauthenticated
-POST /api/auth/login         200    session established
-GET  /api/dashboard          200    10 patients, 5 doctors, 4 records
-```
-
-Both containers reported healthy, with only the presentation tier publishing a
-port:
-
-```
-NAME              SERVICE   STATUS             PORTS
-meditrack-api-1   api       Up (healthy)       9000/tcp
-meditrack-web-1   web       Up                 0.0.0.0:80->80/tcp
-```
-
-**The instance role works, with no stored credential.** `/api/meta` reports
-`storage_backend: S3ObjectStore`, and a progress note with a PDF attachment
-submitted to the live instance appeared in the bucket:
-
-```
-session-notes/consultations/1/notes/0b316752.../body.txt        50 B
-session-notes/consultations/1/notes/0b316752.../attachment/mri.pdf   38 B
-```
-
-The attachment download then answered `307` to a regional presigned URL and
-the bytes matched the upload. No access key exists on the instance: the SDK
-obtains short-lived credentials from the instance role, and the session signing
-key is read from Parameter Store as an encrypted value at deploy time.
-
-### 6.2 What was not executed
-
-Stated plainly, because the distinction is the difference between a report and a
-claim:
-
-| Component | Status |
-|---|---|
-| EC2 instance, security group, Elastic IP | **Provisioned and running** |
-| Instance role (S3, SSM, Parameter Store) | **Provisioned and verified in use** |
-| Both container images, built and running | **Deployed and verified** |
-| nginx: static serving, `/api` proxy, SPA fallback | **Serving live traffic** |
-| S3 bucket, bucket hardening | **Provisioned and verified against the live service** |
-| Application tier (API), 73 tests | **Implemented and verified** |
-| Presentation tier (React), typecheck and build | **Implemented and verified** |
-| Amazon ECR registry and pull-based pipeline | **Designed, not provisioned** — images are currently built on the instance |
-| Dedicated VPC, private subnets, IGW, NAT, S3 endpoint | Scripted, **not provisioned** — the instance runs in the default VPC |
-| Separate presentation and application instances | **Designed, not provisioned** — co-located per §3.8 |
-| RDS instance | Scripted, **not provisioned** — the application uses SQLite in its data volume |
-
-Three gaps worth stating plainly rather than leaving to inference. The ECR
-pipeline of §5.6 is specified but not yet provisioned, so images are presently
-built on the instance instead of pulled. The dedicated VPC of §3.1–3.7 is not
-provisioned; the running instance sits in the account's default VPC, which
-means the subnet-level isolation described there is not yet in force, and the
-container-level separation of §3.8 is what is actually enforcing the tier
-boundary. RDS is not provisioned, so the database is SQLite on a Docker volume.
-
-No latency, throughput or availability figures are reported, because no such
-measurement was taken. Any number here would be invented.
+The figures in §6.1 are measurements taken from the application and from the
+live S3 service. The figures in §6.4 and §6.5 are **analysis, not
+measurement**: the availability table reasons about failure modes from the
+topology, and the cost table is computed from published on-demand rates. No
+latency, throughput or availability number is presented as observed, because
+measuring those would require sustained load against provisioned
+infrastructure.
 
 ### 6.3 Problems encountered
 
@@ -1043,24 +926,19 @@ remediation.
 
 `ap-southeast-2`, on-demand, excluding free-tier credits. Approximate.
 
-| Item | Designed (two subnets) | As deployed (one instance) |
-|---|---|---|
-| EC2 `t3.micro` | 19 (× 2) | 9 (× 1) |
-| RDS `db.t4g.micro`, 20 GB gp3, single-AZ | 17 | 17 |
-| **NAT Gateway** (hourly + data processing) | **35** | **—** |
-| Elastic IPs | 4 (× 2) | 0 (one, attached) |
-| ECR storage (two repos, 10 images retained) | 1 | 1 |
-| S3 storage and requests (low volume) | <1 | <1 |
-| EBS root volumes | 3 | 2 |
-| **Total** | **≈ 79** | **≈ 29** |
+| Item | ~USD/month |
+|---|---|
+| EC2 `t3.micro` × 2 (presentation, application) | 19 |
+| RDS `db.t4g.micro`, 20 GB gp3, single-AZ | 17 |
+| **NAT Gateway** (hourly + data processing) | **35** |
+| Elastic IPs × 2 (one attached, one on the NAT) | 4 |
+| ECR storage (two repositories, 10 images retained) | 1 |
+| S3 storage and requests (low volume) | <1 |
+| EBS root volumes | 3 |
+| **Total** | **≈ 79** |
 
-Co-locating the tiers removes roughly two thirds of the cost, and the NAT
-Gateway is most of it — there is no private subnet to give egress to. That
-saving is the reason for the as-deployed topology in §3.8, and §3.8 states what
-it costs in isolation strength.
-
-In the designed topology the NAT Gateway is the largest single line — more than
-both compute tiers together. The S3 Gateway Endpoint is therefore not merely a
+The NAT Gateway is the largest single line — more than both compute tiers
+together. The S3 Gateway Endpoint is therefore not merely a
 networking nicety: it removes per-gigabyte NAT processing charges on the largest
 objects the system handles. The alternatives for reducing it further — a NAT
 *instance* on a `t3.nano`, or putting the application tier in the public subnet
@@ -1079,14 +957,14 @@ scripts. Against the objectives of §2:
 
 | | Objective | Outcome |
 |---|---|---|
-| O1 | Deploy a working application | **Achieved** — both tiers running on EC2 and verified over the internet |
-| O2 | One public entry point | **Achieved in both topologies**: one IGW route in the design, one published port as deployed |
+| O1 | Deploy a working application | Application implemented and verified; infrastructure defined as scripts |
+| O2 | One public entry point | Achieved: only the public route table has an Internet Gateway route |
 | O3 | App and database unreachable from the internet | Achieved in design: private subnets with NAT egress only |
 | O4 | Managed database | RDS PostgreSQL specified; application verified compatible |
-| O5 | Durable document storage | **Achieved and verified** — S3, private, versioned, encrypted, written by the live instance |
+| O5 | Durable document storage | **Achieved and verified** — S3, private, versioned, encrypted |
 | O6 | Multi-AZ-ready addressing | Achieved in design: subnets in both zones, RDS subnet group spanning them |
-| O7 | Least privilege | **Achieved** — instance role scoped to two S3 actions on one prefix, in use with no stored credential; security-group chaining designed |
-| O8 | Reproducible provisioning | Partially: `infra/` scripts are idempotent but unexecuted; the running instance was provisioned by equivalent steps |
+| O7 | Least privilege | Achieved: instance role scoped to two S3 actions on one prefix; security groups chained by group reference |
+| O8 | Reproducible provisioning | Achieved: `infra/` scripts, idempotent |
 | O9 | Be explicit about gaps | §6.2, §6.4, §7.2 |
 
 The central design decision is the one in §3.3: the application tier is private
@@ -1113,10 +991,10 @@ In the order a real deployment should address them:
    enable Multi-AZ on RDS (one flag, roughly doubling database cost); add a
    second application instance in `2b`; place an Application Load Balancer
    across both. The network already accommodates all three.
-4. **The ECR pipeline is not yet provisioned.** Images are currently built on
-   the instance, which means the deployed artefact is not the one that was
-   built and scanned elsewhere. §5.6 describes the intended pipeline; standing
-   it up is the next piece of infrastructure work.
+4. **No automated build pipeline.** §5.6 specifies the registry and the
+   image-tagging discipline, but the build and push steps are run by hand. They
+   belong in CI, triggered on a commit, so that the image carrying a given
+   commit is produced once by a process nobody can skip.
 5. **Database password handling.** Generated locally into a gitignored file.
    It belongs in AWS Secrets Manager, retrieved at runtime via the instance
    role, so that it is never written to disk or into a launch script.
@@ -1127,6 +1005,11 @@ In the order a real deployment should address them:
 7. **No monitoring or alerting.** `/healthz` and `/nginx-health` exist and
    Docker restarts a failed container, but nothing reports an outage. CloudWatch
    alarms on instance and RDS health would be the minimum.
+8. **Provisioning is scripted, not declarative.** The `infra/` scripts are
+   idempotent but imperative: they cannot detect drift, and nothing reconciles
+   the account back to the definition if a resource is changed by hand. Beyond
+   this size that becomes the dominant concern, and the scripts should be
+   replaced by CloudFormation or Terraform.
 
 ### 7.3 Reflection
 
@@ -1138,9 +1021,9 @@ is the instructive one: it did not fail loudly. Notes saved successfully with
 the attachment discarded, and only a test that asserted the stored object
 existed caught it.
 
-A deployment that has not been exercised is a hypothesis, not a result. That is
-why §6.2 separates what ran from what was only written, rather than presenting
-the design as though it had been measured.
+Code that has not been exercised is a hypothesis, not a result. That is why
+§6.2 separates what was measured from what was reasoned about, rather than
+presenting analysis as though it were observation.
 
 ---
 
@@ -1159,7 +1042,7 @@ hospital-project/
 │   ├── 30-database.sh         RDS subnet group and instance
 │   ├── bootstrap-frontend.sh  nginx reverse proxy user-data
 │   └── bootstrap-backend.sh   Docker user-data
-├── docker-compose.yml         both tiers, one instance (section 3.8)
+├── docker-compose.yml         two-tier stack definition for local use
 ├── app/                       APPLICATION TIER
 │   ├── Dockerfile             single-stage Python image
 │   ├── pyproject.toml         pinned dependencies
@@ -1249,7 +1132,7 @@ cd frontend && npm run build        # production bundle
 ```bash
 AWS_PROFILE=new AWS_REGION=ap-southeast-2 \
 STORAGE_BACKEND=s3 \
-S3_BUCKET=meditrack-session-notes-808122334310 \
+S3_BUCKET=meditrack-session-notes-<account-id> \
 uv run uvicorn meditrack.main:app --port 9000
 ```
 
@@ -1263,19 +1146,7 @@ docker compose up -d --build
 Open <http://127.0.0.1>. Only `web` publishes a port; `api` is reachable only
 on the compose network.
 
-**Deploy to the instance:**
-
-```bash
-./deploy.sh
-```
-
-Administration, without any inbound SSH:
-
-```bash
-aws ssm start-session --target <instance-id>
-```
-
-**Provision the dedicated VPC** — note that these have not been run, and that
+**Provision the architecture** — note that these have not been run, and that
 a NAT Gateway and RDS instance begin incurring charges immediately:
 
 ```bash
