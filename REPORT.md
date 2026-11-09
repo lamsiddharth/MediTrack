@@ -13,13 +13,16 @@
 | **Architecture** | Three tiers: public presentation, private application, private data |
 | **Deployment** | Images published to Amazon ECR and pulled by the instance |
 
-> **Scope of this report.** §1–§4 state the problem, objectives and
-> architecture. §5 describes the implementation of the application and the
-> infrastructure definitions. §6 reports results: measured figures for the
-> application components, and analysis for the architecture — availability
-> exposure and cost. Cost figures are published-rate estimates rather than
-> billed amounts, and no latency, throughput or availability figure is
-> presented as a measurement.
+> **How to read this report.** §1–§2 state the problem and objectives. **§3
+> describes the application briefly** — what it does and how it is shaped —
+> because the infrastructure only makes sense once the workload is clear. **§4
+> and §5 are the substance of the project**: the three-tier architecture, how
+> the tiers reach one another, and why each cloud service was chosen. §6 covers
+> implementation, §7 results, §8 conclusions.
+>
+> Cost and availability figures in §7.4 and §7.5 are analysis derived from the
+> topology and published rates, not measurements; §7.2 says which is which. No
+> latency, throughput or availability figure is presented as observed.
 ---
 
 ## 1. Problem statement
@@ -66,34 +69,149 @@ The deployment problem has a particular shape because the data is clinical:
 
 | # | Objective | How it is addressed |
 |---|---|---|
-| **O1** | Deploy a working hospital management application onto public cloud infrastructure | §5.1 — containerised FastAPI application |
-| **O2** | Expose exactly one public entry point, and no more | §3.2 — only the presentation tier has a route to an Internet Gateway |
-| **O3** | Place the application server and the database beyond reach of the internet | §3.3 — private subnets with no Internet Gateway route; NAT for egress only |
-| **O4** | Use a managed relational database rather than a self-administered one | §4.3 — Amazon RDS for PostgreSQL |
-| **O5** | Store clinical documents durably and independently of server lifetime | §4.4 — Amazon S3, versioned and encrypted |
-| **O6** | Lay out the network so a move to multi-AZ requires no re-addressing | §3.5 — subnets in two AZs from the outset |
-| **O7** | Enforce least privilege between tiers and towards AWS services | §3.4, §4.5 — security-group chaining; scoped IAM policy |
-| **O8** | Keep the design reproducible rather than hand-built | §5.3 — provisioning as scripts under `infra/` |
-| **O9** | Be explicit about what this design does *not* provide | §6.4, §7.2 — single-AZ, no TLS, no failover |
+| **O1** | Deploy a working hospital management application onto public cloud infrastructure | §3 — the application; §6.1 — how it is built |
+| **O2** | Expose exactly one public entry point, and no more | §4.2 — only the presentation tier has a route to an Internet Gateway |
+| **O3** | Place the application server and the database beyond reach of the internet | §4.3 — private subnets with no Internet Gateway route; NAT for egress only |
+| **O4** | Use a managed relational database rather than a self-administered one | §5.3 — Amazon RDS for PostgreSQL |
+| **O5** | Store clinical documents durably and independently of server lifetime | §5.4 — Amazon S3, versioned and encrypted |
+| **O6** | Lay out the network so a move to multi-AZ requires no re-addressing | §4.5 — subnets in two AZs from the outset |
+| **O7** | Enforce least privilege between tiers and towards AWS services | §4.4, §5.5 — security-group chaining; scoped IAM policy |
+| **O8** | Keep the design reproducible rather than hand-built | §6.3 — provisioning as scripts under `infra/` |
+| **O9** | Be explicit about what this design does *not* provide | §7.4, §8.2 — single-AZ, no TLS, no failover |
 
 ### 2.1 Out of scope
 
 Stated deliberately, because a reader should not assume these were overlooked:
 
 - **DNS.** No Route 53 hosted zone, no registered domain. The system is reached
-  by the presentation tier's Elastic IP address. §3.6 explains how the tiers
+  by the presentation tier's Elastic IP address. §4.6 explains how the tiers
   address each other without it.
 - **Automatic failover.** Subnets exist in two zones; compute and the database
-  run in one. §6.4 quantifies the exposure.
-- **TLS.** Traffic is plain HTTP. §7.2 treats this as the first thing to fix and
+  run in one. §7.4 quantifies the exposure.
+- **TLS.** Traffic is plain HTTP. §8.2 treats this as the first thing to fix and
   explains why it was not done here.
 - **Horizontal scaling and load balancing.** One instance per tier.
 
 ---
 
-## 3. System architecture
+## 3. The application
 
-### 3.1 Overview
+Before the infrastructure, what is actually being deployed.
+
+**MediTrack** is a hospital management system for a small clinic: one place for
+patient records, the appointment diary, clinical notes and billing. It was
+written for this project rather than taken off the shelf, so that the thing
+being deployed is a realistic workload rather than a placeholder.
+
+### 3.1 What it does
+
+Five areas, following the path a patient actually takes through a clinic.
+
+| Area | What a user can do |
+|---|---|
+| **Patients** | Register a patient with an auto-allocated medical record number (`MRN-00001`); search by name, MRN or phone; see one page with their details, every appointment and full clinical history |
+| **Doctors** | Maintain the roster — specialisation, room, and a per-doctor consultation fee |
+| **Appointments** | Book a patient with a doctor; browse any day; filter by status; mark cancelled or no-show |
+| **Consultations** | Record what happened at a visit: symptoms, diagnosis, prescription, follow-up date |
+| **Session notes** | Add progress notes to a visit afterwards, each able to carry a document such as a lab report or scan |
+| **Billing** | A fee and payment status per consultation, an unpaid filter, and total outstanding on the dashboard |
+
+The **dashboard** is the landing page: patient and doctor counts, today's
+schedule in time order, who is still waiting to be seen, what is coming up, the
+most recent records, and money outstanding.
+
+### 3.2 Three decisions that make it behave like a real system
+
+Most of the application is ordinary create-read-update work. Three parts are
+not, and they are the parts worth looking at.
+
+**Double-booking is refused, not merely discouraged.** A clinic working from a
+paper diary can book one doctor twice at the same time and nothing notices.
+Slots here are 20 minutes, and a booking that overlaps an existing one for the
+same doctor is rejected with an error naming who already holds the slot:
+
+```
+That doctor already has Arjun Sharma booked at 09:00 on 20 Dec 2026.
+Slots are 20 minutes long — pick another time.
+```
+
+Cancellations and no-shows release the slot, because a cancelled appointment
+should not block the diary.
+
+**Allergies follow the patient.** A known allergy is not a field to go looking
+for; it is shown as a banner on the patient record *and* on every consultation
+page. An allergy note that is not in front of the clinician at the moment of
+prescribing is not a safety control.
+
+**Clinical notes cannot be edited or deleted.** Session notes are append-only.
+A record that can be silently rewritten is not much of a record, and
+append-only is also less code than the alternative.
+
+### 3.3 How a visit flows through it
+
+```
+  register patient  ──►  book appointment  ──►  record consultation
+   (MRN allocated)        (clash checked)       (marks booking complete)
+                                                      │
+                                      ┌───────────────┴───────────────┐
+                                      ▼                               ▼
+                              add session notes                  set payment
+                            (text + attachments)              (unpaid/paid/waived)
+```
+
+Recording a visit against a booking marks that booking completed
+automatically, so the diary cannot drift out of step with what happened. A
+walk-in can be recorded with no prior booking at all.
+
+### 3.4 Shape of the system
+
+Two separate applications, which is what makes the tiering in §4 meaningful
+rather than notional:
+
+- a **React** single-page application — the user interface, a bundle of static
+  files served to the browser;
+- a **FastAPI** JSON API over 24 endpoints — all the logic and all the data
+  access.
+
+They share no code and communicate only over HTTP. The browser talks to one
+origin; `/api/*` is forwarded to the API.
+
+Six tables hold everything:
+
+```
+users ──── authors ───► session_notes ───► consultations ◄─── patients
+                                              ▲    ▲              │
+                                              │    └──────────────┘
+                                        appointments ◄─── doctors
+```
+
+A patient is registered, booked in with a doctor, and the visit produces a
+consultation record. Session notes hang off the consultation; billing lives on
+it. Note text and attachments are **not** in the database — only a key
+pointing into object storage, for the reasons in §5.3.
+
+### 3.5 Signing in
+
+One account, username and password, a signed session cookie. No roles, no
+tokens, no password reset — deliberately minimal, because access control is not
+what this project is about. Three things were not simplified away: the password
+is hashed with bcrypt, the login error is identical for an unknown user and a
+wrong password so the form cannot be used to discover usernames, and the
+post-login redirect accepts only relative paths so it cannot be pointed at
+another site.
+
+On an empty database the system seeds itself a working clinic — 5 doctors, 10
+patients aged 8 to 78 with varied blood groups and allergies, 13 appointments
+positioned relative to today including completed, cancelled and no-show, and 4
+written-up consultations with one left unpaid so the outstanding total is not
+zero. §8.2 lists what a real deployment would need beyond this.
+
+---
+
+
+## 4. System architecture
+
+### 4.1 Overview
 
 Three tiers, each in its own subnet class, each reachable only from the tier in
 front of it.
@@ -161,7 +279,7 @@ front of it.
                        +--------------------------+
 ```
 
-### 3.2 Presentation tier — public subnet
+### 4.2 Presentation tier — public subnet
 
 One `t3.micro` in `10.20.1.0/24`, AZ `ap-southeast-2a`, with an Elastic IP.
 
@@ -245,7 +363,7 @@ It also exposes `/nginx-health`, answered by the proxy itself, so that a health
 check can distinguish "the edge is up but the application is not" from "nothing
 is up" — which is the first question to ask during an incident.
 
-### 3.3 Application tier — private subnet
+### 4.3 Application tier — private subnet
 
 One `t3.micro` in `10.20.11.0/24`, AZ `ap-southeast-2a`. **No public IP
 address.**
@@ -263,7 +381,7 @@ public subnet and performs source translation for outbound connections only. A
 NAT Gateway does not accept unsolicited inbound connections; there is no port
 forwarding to configure and therefore none to misconfigure.
 
-### 3.4 Data tier — private subnet
+### 4.4 Data tier — private subnet
 
 **Amazon RDS for PostgreSQL**, `db.t4g.micro`, 20 GB gp3, storage encrypted.
 
@@ -294,13 +412,13 @@ instance is replaced and given a different address:
 | `sg-database` | 5432 | **`sg-backend`** | only the app may reach the database |
 
 There is deliberately **no inbound rule for port 22 on either tier**.
-Administration goes through Systems Manager, as described in §3.6, so no
+Administration goes through Systems Manager, as described in §4.6, so no
 administrative port is exposed at all.
 
 The database accepts connections from exactly one source, identified by group
 membership rather than by address.
 
-### 3.5 Why two Availability Zones with one deployment
+### 4.5 Why two Availability Zones with one deployment
 
 Subnets are created in both `ap-southeast-2a` and `ap-southeast-2b`. Compute and
 the database run only in `2a`. This is a deliberate cost decision, not an
@@ -318,7 +436,7 @@ What the idle second zone buys, for no running cost:
 Empty subnets cost nothing. A NAT Gateway, a second instance and an RDS standby
 all do, which is why only the subnets exist now.
 
-### 3.6 How the tiers address one another without Route 53
+### 4.6 How the tiers address one another without Route 53
 
 This is the question the architecture has to answer most carefully, since there
 is no DNS service in the design.
@@ -394,7 +512,7 @@ The private tier remains reachable this way even though it has no public
 address and no route to an Internet Gateway, because the agent's connection is
 outbound.
 
-### 3.7 Request path, end to end
+### 4.7 Request path, end to end
 
 A clinician opening a patient record involves two distinct exchanges.
 
@@ -437,7 +555,7 @@ application instance or the proxy, which matters when both are `t3.micro`.
 
 ---
 
-## 4. Cloud services used
+## 5. Cloud services used
 
 | Service | Role | Configuration |
 |---|---|---|
@@ -445,7 +563,7 @@ application instance or the proxy, which matters when both are `t3.micro`.
 | **Internet Gateway** | Public inbound and outbound | Attached; default route for public subnets only |
 | **NAT Gateway** | Private outbound only | In public subnet `2a`, with its own Elastic IP |
 | **Route tables** | Separate public and private routing | Public → IGW; private → NAT + S3 endpoint |
-| **Security groups** | Stateful per-tier firewalls | Chained by group reference, §3.4 |
+| **Security groups** | Stateful per-tier firewalls | Chained by group reference, §4.4 |
 | **Amazon EC2** | Both compute tiers | 2 × `t3.micro`, Amazon Linux 2023 |
 | **Elastic IP** | Stable public address without DNS | One for the frontend, one for the NAT |
 | **Amazon RDS** | Managed PostgreSQL | `db.t4g.micro`, single-AZ, encrypted, 7-day backups |
@@ -455,7 +573,7 @@ application instance or the proxy, which matters when both are `t3.micro`.
 | **S3 Gateway VPC Endpoint** | Keep S3 traffic off NAT | Prefix-list route in the private table |
 | **AWS IAM** | Least-privilege service access | One user, two S3 actions, one prefix |
 
-### 4.1 Why EC2 and not a container service
+### 5.1 Why EC2 and not a container service
 
 ECS or EKS would remove instance management. Both were rejected for this scale:
 EKS has a fixed control-plane charge larger than the entire rest of this
@@ -464,7 +582,7 @@ routing and security groups — the parts this project is actually about — whi
 making the compute layer harder to inspect while learning. EC2 keeps the
 networking visible, which is the point.
 
-### 4.2 Why RDS and not PostgreSQL on the instance
+### 5.2 Why RDS and not PostgreSQL on the instance
 
 Running PostgreSQL on the application instance would be cheaper and is
 genuinely tempting at this size. RDS was chosen for three things that are
@@ -479,7 +597,7 @@ enums stored as `VARCHAR` rather than native PostgreSQL types, and all
 SQLite-specific code guarded. The same image runs against SQLite locally and
 RDS in the VPC with only `DATABASE_URL` changing.
 
-### 4.3 Why S3 for clinical documents
+### 5.3 Why S3 for clinical documents
 
 Clinical attachments are the wrong shape for both a relational database and an
 instance disk. In RDS they would inflate every backup and consume provisioned
@@ -496,7 +614,7 @@ server. The bucket is configured:
 | Versioning | enabled | an overwritten or deleted object is recoverable |
 | Bucket policy | deny `aws:SecureTransport = false` | rejects any non-TLS request outright |
 
-### 4.4 Object layout
+### 5.4 Object layout
 
 ```
 s3://meditrack-session-notes-<account-id>/
@@ -511,7 +629,7 @@ The per-note component is a random UUID rather than a database id. Keys
 therefore do not depend on database sequence values, which keeps the two stores
 independent and means an object key cannot be guessed by incrementing a number.
 
-### 4.5 IAM and the credential problem
+### 5.5 IAM and the credential problem
 
 The application needs exactly two S3 actions on one prefix:
 
@@ -549,9 +667,9 @@ written into a launch script.
 
 ---
 
-## 5. Implementation
+## 6. Implementation
 
-### 5.1 Application tier — implemented and tested
+### 6.1 Application tier — implemented and tested
 
 A JSON API, in `app/meditrack/`.
 
@@ -568,7 +686,7 @@ A JSON API, in `app/meditrack/`.
 2,082 lines, 24 endpoints. Response schemas are deliberately separate from the SQLAlchemy
 models, so renaming a column cannot silently change the shape of a response.
 
-### 5.2 Presentation tier — implemented and tested
+### 6.2 Presentation tier — implemented and tested
 
 A React single-page application, in `frontend/src/`.
 
@@ -624,7 +742,7 @@ Functionality delivered:
   cannot be used to enumerate usernames, and a `?next=` parameter restricted to
   relative paths so it cannot redirect off-site after login.
 
-### 5.3 Storage abstraction
+### 6.3 Storage abstraction
 
 Two drivers behind one interface (`storage.py`), selected by
 `STORAGE_BACKEND`:
@@ -637,16 +755,16 @@ Nothing above this module knows which is in use. This is what allowed the S3
 integration to be tested exhaustively offline against `moto`, and then verified
 separately against the real service.
 
-### 5.4 Infrastructure as scripts
+### 6.4 Infrastructure as scripts
 
-The architecture of §3 is expressed as scripts rather than described in prose
+The architecture of §4 is expressed as scripts rather than described in prose
 and built by hand, so that it is reproducible and reviewable:
 
 | File | Creates |
 |---|---|
 | `00-config.sh` | Shared variables: region, AZs, CIDRs, instance classes |
 | `10-network.sh` | VPC, four subnets, IGW, NAT Gateway, route tables, S3 endpoint |
-| `20-security-groups.sh` | The three chained security groups of §3.4 |
+| `20-security-groups.sh` | The three chained security groups of §4.4 |
 | `30-database.sh` | DB subnet group across both AZs, single-AZ RDS instance |
 | `bootstrap-frontend.sh` | User-data for the presentation tier |
 | `bootstrap-backend.sh` | User-data for the application tier |
@@ -661,9 +779,9 @@ Shell scripts against the AWS CLI were chosen over CloudFormation or Terraform
 deliberately. At this size the declarative tools' advantages — drift detection
 and dependency graphs — buy little, while the scripts keep every API call
 visible, which was the point of the exercise. For anything larger the trade
-reverses, and §7.2 says so.
+reverses, and §8.2 says so.
 
-### 5.5 Container images
+### 6.5 Container images
 
 Two images, one per tier.
 
@@ -682,7 +800,7 @@ application is small enough that the bundler never approaches the memory
 ceiling. Dependencies are copied before source so that a source-only change
 reuses the `npm ci` layer.
 
-### 5.6 Deployment pipeline
+### 6.6 Deployment pipeline
 
 Images are built once, published to a private registry, and pulled by the
 instance. Nothing is compiled on the host at deploy time.
@@ -768,9 +886,9 @@ An ECR lifecycle policy keeps the ten most recent images per repository and
 expires the rest, so the registry does not accumulate every build ever made
 while still retaining enough history for a rollback.
 
-## 6. Results
+## 7. Results
 
-### 6.1 Application verification
+### 7.1 Application verification
 
 **Backend test suite — 73 tests, all passing.**
 
@@ -798,7 +916,7 @@ produces 267 kB of JavaScript (82 kB gzipped) in 1.66 s.
 
 **Both tiers verified together across the proxy boundary.** The API and the
 presentation tier were run as separate processes with `/api` forwarded by
-path — the same forwarding nginx performs in the architecture of §3.2 — and
+path — the same forwarding nginx performs in the architecture of §4.2 — and
 driven end to end:
 
 ```
@@ -835,7 +953,7 @@ content-disposition        : attachment; filename="Lab_Report.pdf"
 ```
 
 A note with a PDF attachment submitted through the running application wrote
-both objects to the bucket under the layout of §4.4, the body was read back
+both objects to the bucket under the layout of §5.4, the body was read back
 and rendered, and the attachment downloaded through a presigned URL matched
 the upload byte for byte.
 
@@ -852,20 +970,20 @@ region              : ap-southeast-2
 **Database portability — verified without an instance.** A PostgreSQL
 `DATABASE_URL` produces a correctly configured engine (`psycopg` driver,
 `QueuePool` of 5, pre-ping enabled) without contacting a server, confirming the
-application is ready for the data tier of §3.4 with only a configuration
+application is ready for the data tier of §4.4 with only a configuration
 change.
 
-### 6.2 What is measured and what is estimated
+### 7.2 What is measured and what is estimated
 
-The figures in §6.1 are measurements taken from the application and from the
-live S3 service. The figures in §6.4 and §6.5 are **analysis, not
+The figures in §7.1 are measurements taken from the application and from the
+live S3 service. The figures in §7.4 and §7.5 are **analysis, not
 measurement**: the availability table reasons about failure modes from the
 topology, and the cost table is computed from published on-demand rates. No
 latency, throughput or availability number is presented as observed, because
 measuring those would require sustained load against provisioned
 infrastructure.
 
-### 6.3 Problems encountered
+### 7.3 Problems encountered
 
 Three defects were found by testing the S3 feature, each of which would have
 reached users:
@@ -904,7 +1022,7 @@ surfaced two more:
 A test-isolation defect was also found and fixed: the password-change test left
 the shared account's password altered, breaking every test that ran after it.
 
-### 6.4 Availability assessment
+### 7.4 Availability assessment
 
 With compute and database in `ap-southeast-2a` only:
 
@@ -919,10 +1037,10 @@ With compute and database in `ap-southeast-2a` only:
 
 The last row is the only graceful degradation in the system, and it exists
 because it was deliberately built and tested. Everything above it is a hard
-outage. That is the honest cost of a single-AZ deployment, and §7.2 gives the
+outage. That is the honest cost of a single-AZ deployment, and §8.2 gives the
 remediation.
 
-### 6.5 Indicative monthly cost
+### 7.5 Indicative monthly cost
 
 `ap-southeast-2`, on-demand, excluding free-tier credits. Approximate.
 
@@ -943,13 +1061,13 @@ networking nicety: it removes per-gigabyte NAT processing charges on the largest
 objects the system handles. The alternatives for reducing it further — a NAT
 *instance* on a `t3.nano`, or putting the application tier in the public subnet
 with no inbound rules — trade either self-managed NAT or the isolation property
-of §3.3, which is the substance of the design.
+of §4.3, which is the substance of the design.
 
 ---
 
-## 7. Conclusion
+## 8. Conclusion
 
-### 7.1 What was achieved
+### 8.1 What was achieved
 
 A hospital management application was written, tested and run, and a three-tier
 AWS architecture was designed and expressed as reproducible provisioning
@@ -965,16 +1083,16 @@ scripts. Against the objectives of §2:
 | O6 | Multi-AZ-ready addressing | Achieved in design: subnets in both zones, RDS subnet group spanning them |
 | O7 | Least privilege | Achieved: instance role scoped to two S3 actions on one prefix; security groups chained by group reference |
 | O8 | Reproducible provisioning | Achieved: `infra/` scripts, idempotent |
-| O9 | Be explicit about gaps | §6.2, §6.4, §7.2 |
+| O9 | Be explicit about gaps | §7.2, §7.4, §8.2 |
 
-The central design decision is the one in §3.3: the application tier is private
+The central design decision is the one in §4.3: the application tier is private
 because its **route table has no path to an Internet Gateway**, not because a
 firewall rule denies traffic. Routing absence is a stronger guarantee than rule
 presence — a security-group error alone cannot expose it. Expressing that
 property correctly, and understanding why it is stronger, was the main learning
 outcome of the project.
 
-### 7.2 Limitations and what to do next
+### 8.2 Limitations and what to do next
 
 In the order a real deployment should address them:
 
@@ -991,7 +1109,7 @@ In the order a real deployment should address them:
    enable Multi-AZ on RDS (one flag, roughly doubling database cost); add a
    second application instance in `2b`; place an Application Load Balancer
    across both. The network already accommodates all three.
-4. **No automated build pipeline.** §5.6 specifies the registry and the
+4. **No automated build pipeline.** §6.6 specifies the registry and the
    image-tagging discipline, but the build and push steps are run by hand. They
    belong in CI, triggered on a commit, so that the image carrying a given
    commit is produced once by a process nobody can skip.
@@ -1011,10 +1129,10 @@ In the order a real deployment should address them:
    this size that becomes the dominant concern, and the scripts should be
    replaced by CloudFormation or Terraform.
 
-### 7.3 Reflection
+### 8.3 Reflection
 
 The most useful lesson was not architectural but methodological. Three of the
-defects in §6.3 — the 422 on an empty file input, the silently dropped
+defects in §7.3 — the 422 on an empty file input, the silently dropped
 attachments, and the 403 on presigned URLs — were invisible to reasoning about
 the code and surfaced only by exercising it against the real service. The second
 is the instructive one: it did not fail loudly. Notes saved successfully with
@@ -1022,7 +1140,7 @@ the attachment discarded, and only a test that asserted the stored object
 existed caught it.
 
 Code that has not been exercised is a hypothesis, not a result. That is why
-§6.2 separates what was measured from what was reasoned about, rather than
+§7.2 separates what was measured from what was reasoned about, rather than
 presenting analysis as though it were observation.
 
 ---
