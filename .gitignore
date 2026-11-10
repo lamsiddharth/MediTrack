@@ -35,3 +35,6 @@ infra/state.env
 
 # Real deployment notes - operational, not for submission
 DEPLOYMENT-ACTUAL.md
+
+# Real S3 bucket name (embeds the AWS account id)
+.s3-bucket

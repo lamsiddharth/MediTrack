@@ -40,7 +40,12 @@ export DB_ENGINE_VERSION="16.4"
 export DB_STORAGE_GB="20"
 
 # Object storage. Already provisioned; see README.
-export S3_BUCKET="${S3_BUCKET:-meditrack-session-notes-808122334310}"
+# Not committed: the bucket name embeds an AWS account id. Set S3_BUCKET in
+# the environment, or put the name in .s3-bucket at the repository root.
+if [[ -z "${S3_BUCKET:-}" && -f "$(dirname "${BASH_SOURCE[0]}")/../.s3-bucket" ]]; then
+  S3_BUCKET="$(tr -d '[:space:]' < "$(dirname "${BASH_SOURCE[0]}")/../.s3-bucket")"
+fi
+export S3_BUCKET="${S3_BUCKET:-}"
 export S3_PREFIX="session-notes"
 
 STATE_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/state.env"

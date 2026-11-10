@@ -9,7 +9,7 @@ Docker. Written for this project rather than vendored from elsewhere.
 | **Application tier** | Python / FastAPI JSON API, SQLAlchemy |
 | **Database** | SQLite by default; PostgreSQL / RDS via `DATABASE_URL` |
 | **Deployment** | Over AWS Systems Manager. No SSH, no inbound port 22. |
-| **Session notes** | Stored in S3 (`meditrack-session-notes-808122334310`, ap-southeast-2) |
+| **Session notes** | Stored in S3 (`ap-southeast-2`) |
 | **Cloud** | AWS EC2 — `t3.micro`, Amazon Linux 2023 |
 | **Sign in** | `admin` / `admin123` — change it immediately after first login |
 
@@ -163,10 +163,18 @@ redeploying does not sign you out. That file is gitignored — keep it.
 
 ## Object storage for session notes
 
-The bucket is already created in account `808122334310` (ap-southeast-2):
+Create a bucket in your own account (bucket names are globally unique, so
+incorporate something unique such as your account id):
 
 ```
-meditrack-session-notes-808122334310
+meditrack-session-notes-<account-id>
+```
+
+The scripts do not hardcode this, since the name embeds an account id. Record
+it once and it is picked up from there:
+
+```bash
+echo meditrack-session-notes-<account-id> > .s3-bucket   # gitignored
 ```
 
 It is configured with all public access blocked, SSE-S3 default encryption,
@@ -182,7 +190,7 @@ carrying exactly:
 {
   "Effect": "Allow",
   "Action": ["s3:PutObject", "s3:GetObject"],
-  "Resource": "arn:aws:s3:::meditrack-session-notes-808122334310/session-notes/*"
+  "Resource": "arn:aws:s3:::meditrack-session-notes-<account-id>/session-notes/*"
 }
 ```
 
@@ -271,7 +279,7 @@ The instance needs to reach S3, read its configuration, and be reachable by
 Systems Manager. All three come from one role, so nothing is stored on the host.
 
 ```bash
-BUCKET=meditrack-session-notes-808122334310
+BUCKET=meditrack-session-notes-<account-id>
 ACCT=$(aws sts get-caller-identity --query Account --output text)
 
 cat > /tmp/trust.json <<'EOF'
@@ -312,7 +320,7 @@ aws iam add-role-to-instance-profile \
 aws ssm put-parameter --name /meditrack/secret-key --type SecureString \
   --value "$(head -c 32 /dev/urandom | base64 | tr -d '=+/')" --overwrite
 aws ssm put-parameter --name /meditrack/s3-bucket --type String \
-  --value meditrack-session-notes-808122334310 --overwrite
+  --value meditrack-session-notes-<account-id> --overwrite
 aws ssm put-parameter --name /meditrack/s3-prefix --type String \
   --value session-notes --overwrite
 ```
@@ -421,8 +429,8 @@ Then copy it off the instance via S3, since there is no SSH channel:
 ```bash
 aws ssm send-command --instance-ids "$INSTANCE" \
   --document-name AWS-RunShellScript \
-  --parameters 'commands=["aws s3 cp /tmp/backup.tar.gz s3://meditrack-session-notes-808122334310/deploy/backup.tar.gz --region ap-southeast-2"]'
-aws s3 cp s3://meditrack-session-notes-808122334310/deploy/backup.tar.gz .
+  --parameters 'commands=["aws s3 cp /tmp/backup.tar.gz s3://meditrack-session-notes-<account-id>/deploy/backup.tar.gz --region ap-southeast-2"]'
+aws s3 cp s3://meditrack-session-notes-<account-id>/deploy/backup.tar.gz .
 ```
 
 ## Updating after a change

@@ -29,7 +29,17 @@ MEDITRACK_REGION="${MEDITRACK_REGION:-ap-southeast-2}"
 export AWS_REGION="$MEDITRACK_REGION"
 export AWS_DEFAULT_REGION="$MEDITRACK_REGION"
 
-BUCKET="${S3_BUCKET:-meditrack-session-notes-808122334310}"
+# The bucket name embeds an AWS account id, so it is not committed. Set
+# S3_BUCKET, or put the name in .s3-bucket (gitignored).
+if [[ -z "${S3_BUCKET:-}" && -f .s3-bucket ]]; then
+  S3_BUCKET="$(tr -d '[:space:]' < .s3-bucket)"
+fi
+if [[ -z "${S3_BUCKET:-}" ]]; then
+  echo "S3_BUCKET is not set and .s3-bucket does not exist." >&2
+  echo "  echo <your-bucket-name> > .s3-bucket" >&2
+  exit 1
+fi
+BUCKET="$S3_BUCKET"
 PARAM_PREFIX="${PARAM_PREFIX:-/meditrack}"
 REMOTE_DIR="/opt/meditrack"
 STAMP="$(date -u +%Y%m%d-%H%M%S)"
